@@ -8,10 +8,22 @@ version = "0.1.0"
 description = "One portable engine that turns a folder of markdown tickets into a live, themeable project-portfolio interface — many interfaces, one switchable hub."
 readme = "README.md"
 requires-python = ">=3.8"
+license = { text = "MIT" }
+license-files = ["LICENSE"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Environment :: Console",
+]
 dependencies = []
 
 [project.scripts]
 interfacile = "interfacile.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aphoristicEpigram/interfacile"
+Repository = "https://github.com/aphoristicEpigram/interfacile"
+Issues = "https://github.com/aphoristicEpigram/interfacile/issues"
 
 [tool.setuptools]
 packages = ["interfacile"]

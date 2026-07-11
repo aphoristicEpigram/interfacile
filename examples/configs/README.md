@@ -39,10 +39,15 @@ Unknown codes fall back to the bare code and a default emoji, so this is optiona
 but it's what makes the epic pages read nicely.
 
 ### `theme`
-Either the **name of a built-in preset** (`"blue"` or `"violet-neon"`), or an
-**inline palette object**. Naming a preset is the zero-risk way to keep today's
-look. A custom theme looks like this — a small set of semantic roles for light
-and dark, plus the optional top signature strip:
+Either the **name of a built-in preset**, or an **inline palette object**. Each
+preset has a distinctive background — the quickest cue for which interface you're
+looking at. Built-ins:
+
+`blue`, `violet-neon`, `green`, `forest`, `teal`, `cyan`, `indigo`, `violet`,
+`rose`, `crimson`, `orange`, `amber`, `lime`, `slate`.
+
+A custom theme is a small set of semantic roles for light and dark, plus an
+optional top signature strip:
 
 ```json
 "theme": {
@@ -72,6 +77,16 @@ An array naming the dashboard sections in the order you want them, e.g.
 to keep the default order and full set. (Exact panel keys are finalised when the
 reorder feature lands; the two examples omit this and so render the standard
 layout.)
+
+### `shortcut` (optional)
+A single key that switches to this interface from anywhere in the hub — press it
+(e.g. `"1"`) and the board flips, no mouse needed. It's shown as a keycap in the
+switcher menu, and ignored while you're typing in a field. Give each interface a
+distinct key (digits are safest).
+
+```json
+"shortcut": "1"
+```
 
 ### `server` (optional)
 | Key | Meaning |

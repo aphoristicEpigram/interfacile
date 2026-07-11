@@ -1,0 +1,24 @@
+{
+  "brand": {
+    "name": "interfacile",
+    "favicon": "🧩",
+    "icon": "🧩",
+    "eyebrow": "Ticket portfolio · self-hosted",
+    "tagline": "interfacile is built with interfacile —"
+  },
+  "ids": { "prefix": "IF", "digits": 4 },
+  "epics": {
+    "E001": { "title": "Consolidation & Config", "emoji": "🧩" },
+    "E002": { "title": "Packaging & CLI", "emoji": "📦" },
+    "E003": { "title": "Multi-interface Hub", "emoji": "🛰️" },
+    "E004": { "title": "Onboarding", "emoji": "🚀" }
+  },
+  "theme": {
+    "name": "acid",
+    "strip": ["#39FF14", "#ff2d9b", "#15181a"],
+    "light": { "ground": "#d7efcb", "surface": "#ffffff", "ink": "#141a0e", "accent": "#d6217e" },
+    "dark":  { "ground": "#101a0b", "surface": "#18220f", "ink": "#eaf3dd", "accent": "#ff5fb0" }
+  },
+  "shortcut": "3",
+  "server": { "port": 8790 }
+}

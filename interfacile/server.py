@@ -84,6 +84,7 @@ TAGLINE = "The PII-firewall build tracked as"
 SERVER_PORT = 8787               # default listen port (config/--port override)
 THEME_REMAP = {}                 # canonical(blue)->theme hex map; {} == blue
 THEME_STRIP = None               # signature-strip colours, or None
+THEME_OVERRIDE_CSS = ""          # custom-palette :root override, or ""
 
 # Frozen copies of the built-in defaults. apply_config() falls back to *these*
 # for any missing key, so switching interfaces resets cleanly instead of
@@ -2168,7 +2169,7 @@ width:38px;height:32px;cursor:pointer;line-height:1;padding:0;display:inline-fle
 .nb-notes:hover,.nb-notes.active{border-color:#b45309;background:rgba(234,179,8,.32)}
 .nb-todo{background:rgba(220,38,38,.12)}
 .nb-todo:hover,.nb-todo.active{border-color:#c23b3b;background:rgba(220,38,38,.26)}
-.notepanel{position:fixed;top:0;right:0;bottom:0;width:min(460px,92vw);z-index:80;display:flex;flex-direction:column;
+.notepanel{position:fixed;top:0;right:0;bottom:0;width:min(460px,92vw);z-index:500;display:flex;flex-direction:column;
 background:var(--surface);border-left:1px solid var(--line);box-shadow:-18px 0 44px rgba(0,0,0,.22)}
 .notepanel[hidden]{display:none}
 .np-head{display:flex;align-items:center;gap:9px;padding:12px 14px;border-bottom:1px solid var(--line);flex:none}
@@ -5523,13 +5524,115 @@ THEMES = {
 }
 
 
+def _hexrgb(h):
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgbhex(t):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(c)))) for c in t)
+
+
+def _mix(a, b, t):
+    """Blend hex a toward hex b by fraction t (0..1)."""
+    ra, rb = _hexrgb(a), _hexrgb(b)
+    return _rgbhex(tuple(ra[i] * (1 - t) + rb[i] * t for i in range(3)))
+
+
+def _palette_css(light, dark, strip):
+    """Build a :root override (both the dashboard and flow-page variable
+    vocabularies) from a small set of semantic roles, deriving surface/soft
+    tints so a repo only specifies the colours that define its identity."""
+    def block(pal, surface):
+        g = pal.get
+        surf = g("surface", "#ffffff")
+        ground = g("ground", "#e9edf1")
+        ink = g("ink", "#101720")
+        acc = g("accent", "#1c3bb3")
+        done = g("done", "#2f9e5b")
+        warn = g("warn", "#b3781a")
+        line = g("line", _mix(ground, ink, .14))
+        muted = g("muted", _mix(ink, surf, .42))
+        wf = g("wontfix", muted)
+        surf2 = g("surface2", _mix(surf, ground, .5))
+        ink2 = g("ink2", _mix(ink, surf, .28))
+        soft = lambda c: _mix(c, surface, .86)
+        pairs = [
+            ("--bg", ground), ("--ground", ground), ("--surface", surf),
+            ("--surface2", surf2), ("--surface-2", surf2),
+            ("--ink", ink), ("--ink2", ink2), ("--ink-2", ink2),
+            ("--mut", muted), ("--ink-mut", muted),
+            ("--line", line), ("--line-2", _mix(line, surf, .5)),
+            ("--accent", acc), ("--accent-ink", acc), ("--accent-soft", soft(acc)),
+            ("--done", done), ("--done-soft", soft(done)),
+            ("--wf", wf), ("--wf-soft", soft(wf)), ("--warn", warn),
+        ]
+        return ":root{%s}" % ";".join("%s:%s" % kv for kv in pairs)
+
+    css = block(light, light.get("surface", "#ffffff"))
+    css += "@media(prefers-color-scheme:dark){%s}" % block(dark, dark.get("surface", "#141b25"))
+    css += (".b-open{background:var(--accent-soft);color:var(--accent-ink)}"
+            ".b-closed{background:var(--done-soft);color:var(--done)}"
+            ".b-wf{background:var(--wf-soft);color:var(--wf)}")
+    if strip:
+        css += ("html::before{content:'';display:block;height:3px;"
+                "background:linear-gradient(90deg,%s)}" % ",".join(strip))
+    return css
+
+
+# Palette presets — each has a distinctive background (the key context cue when
+# switching interfaces). Only ground/surface/ink/accent are needed; line, muted,
+# tints, and dark-mode softs derive. Plus the two remap presets in THEMES
+# (blue, violet-neon), that's 14 built-in looks.
+PRESETS = {
+    "green":   {"light": {"ground": "#dcefd0", "surface": "#ffffff", "ink": "#15200f", "accent": "#2e8f43"},
+                "dark":  {"ground": "#101a0c", "surface": "#18220f", "ink": "#e8f3dd", "accent": "#5fd06a"}},
+    "forest":  {"light": {"ground": "#d2e7db", "surface": "#ffffff", "ink": "#0f1f17", "accent": "#12795a"},
+                "dark":  {"ground": "#0c1711", "surface": "#132019", "ink": "#daeee4", "accent": "#33c79a"}},
+    "teal":    {"light": {"ground": "#d2ecec", "surface": "#ffffff", "ink": "#0f1e1e", "accent": "#0c8f8f"},
+                "dark":  {"ground": "#0a1717", "surface": "#11201f", "ink": "#daeeee", "accent": "#2ed9d9"}},
+    "cyan":    {"light": {"ground": "#d5ecf6", "surface": "#ffffff", "ink": "#0d1c24", "accent": "#0a86ad"},
+                "dark":  {"ground": "#0a1620", "surface": "#111f28", "ink": "#dceef7", "accent": "#38c6e6"}},
+    "indigo":  {"light": {"ground": "#e2e2fb", "surface": "#ffffff", "ink": "#141433", "accent": "#4b4bd6"},
+                "dark":  {"ground": "#101026", "surface": "#17173a", "ink": "#e6e6f7", "accent": "#8f8ff5"}},
+    "violet":  {"light": {"ground": "#ece0f7", "surface": "#ffffff", "ink": "#1f1430", "accent": "#8b3fd6"},
+                "dark":  {"ground": "#160f24", "surface": "#1e1633", "ink": "#efe6fa", "accent": "#c48ff5"}},
+    "rose":    {"light": {"ground": "#fbe0ec", "surface": "#ffffff", "ink": "#2a0f1c", "accent": "#d6217e"},
+                "dark":  {"ground": "#1f0a15", "surface": "#2a1020", "ink": "#fbe0ec", "accent": "#ff6fb0"}},
+    "crimson": {"light": {"ground": "#fadfe0", "surface": "#ffffff", "ink": "#280f11", "accent": "#cf2f3b"},
+                "dark":  {"ground": "#1c0b0c", "surface": "#271012", "ink": "#fbe0e1", "accent": "#f56b74"}},
+    "orange":  {"light": {"ground": "#fde7cf", "surface": "#ffffff", "ink": "#241608", "accent": "#d9741a"},
+                "dark":  {"ground": "#1c1108", "surface": "#271910", "ink": "#fbe8d6", "accent": "#ffa24d"}},
+    "amber":   {"light": {"ground": "#fbf1c9", "surface": "#ffffff", "ink": "#221d08", "accent": "#b8901a"},
+                "dark":  {"ground": "#1a1608", "surface": "#241f10", "ink": "#f7f0d6", "accent": "#f0c74d"}},
+    "lime":    {"light": {"ground": "#eaf3c9", "surface": "#ffffff", "ink": "#1c2008", "accent": "#6f9e1a"},
+                "dark":  {"ground": "#141808", "surface": "#1e2210", "ink": "#eef3d6", "accent": "#b6e04a"}},
+    "slate":   {"light": {"ground": "#e4e8ee", "surface": "#ffffff", "ink": "#141a22", "accent": "#47566b"},
+                "dark":  {"ground": "#0f141a", "surface": "#171d26", "ink": "#e6ebf2", "accent": "#8fa0b8"}},
+}
+
+
 def resolve_theme(theme):
-    """(theme name, or inline dict with a 'name' base) -> (hex-remap, strip)."""
-    if isinstance(theme, dict):
-        base = THEMES.get(theme.get("name"), {"remap": {}, "strip": None})
-        return dict(base.get("remap", {})), theme.get("strip", base.get("strip"))
-    t = THEMES.get(theme, THEMES["blue"])
-    return dict(t.get("remap", {})), t.get("strip")
+    """-> (hex_remap, strip_colours, override_css). A string (or {"name": ...})
+    selects a built-in palette PRESET or a remap THEME; a dict with a `light`
+    palette is a fully custom theme."""
+    if isinstance(theme, dict) and (theme.get("light") or theme.get("palette")):
+        light = theme.get("light") or theme.get("palette") or {}
+        dark = theme.get("dark") or light
+        return {}, None, _palette_css(light, dark, theme.get("strip"))
+    name = theme.get("name") if isinstance(theme, dict) else theme
+    strip = theme.get("strip") if isinstance(theme, dict) else None
+    if name in PRESETS:
+        p = PRESETS[name]
+        return {}, None, _palette_css(p["light"], p["dark"],
+                                      strip if strip is not None else p.get("strip"))
+    if name in THEMES:
+        t = THEMES[name]
+        return dict(t.get("remap", {})), (strip if strip is not None else t.get("strip")), ""
+    t = THEMES["blue"]
+    return dict(t.get("remap", {})), t.get("strip"), ""
 
 
 def _transform_html(s):
@@ -5555,6 +5658,9 @@ def _transform_html(s):
         s = s.replace("The PII-firewall build tracked as", TAGLINE)
     if EYEBROW != "Ticket portfolio &middot; engineering program":
         s = s.replace("Ticket portfolio &middot; engineering program", EYEBROW)
+    if THEME_OVERRIDE_CSS:
+        s = s.replace("</head>", "<style>" + THEME_OVERRIDE_CSS + "</style></head>", 1)
+    s = s.replace("</body>", _FOOTER + "</body>", 1)
     if len(INTERFACES) > 1:
         s = _BODY_OPEN_RE.sub(lambda m: m.group(1) + _switcher_html(), s, count=1)
     return s
@@ -5584,6 +5690,7 @@ def apply_config(conf):
     Missing keys keep the current (default) value, so partial configs are fine."""
     global PFX, ID_DIGITS, BRAND, FAVICON, HEADER_ICON, EYEBROW, TAGLINE
     global SERVER_PORT, EPIC_TITLES, EPIC_EMOJI, THEME_REMAP, THEME_STRIP, _IDRE
+    global THEME_OVERRIDE_CSS
     global TICKET_ID_RE, EPIC_CODE_RE, TICKET_PARTS_RE, DEP_ID_RE, SUB_ID_RE
     global TICKET_LINK_RE, EPIC_LINK_RE, _MD_EPIC_FILE_RE, _MD_TICKET_FILE_RE
 
@@ -5618,7 +5725,7 @@ def apply_config(conf):
         EPIC_TITLES = dict(_DEF_EPIC_TITLES)
         EPIC_EMOJI = dict(_DEF_EPIC_EMOJI)
 
-    THEME_REMAP, THEME_STRIP = resolve_theme(conf.get("theme", "blue"))
+    THEME_REMAP, THEME_STRIP, THEME_OVERRIDE_CSS = resolve_theme(conf.get("theme", "blue"))
     SERVER_PORT = int(conf.get("server", {}).get("port", _DEF["port"]))
 
 
@@ -5629,10 +5736,11 @@ def apply_config(conf):
 # user dashboard — requests are effectively serial anyway).
 # --------------------------------------------------------------------------- #
 class Interface:
-    __slots__ = ("slug", "name", "icon", "root", "conf")
+    __slots__ = ("slug", "name", "icon", "root", "conf", "shortcut")
 
-    def __init__(self, slug, name, icon, root, conf):
+    def __init__(self, slug, name, icon, root, conf, shortcut=""):
         self.slug, self.name, self.icon, self.root, self.conf = slug, name, icon, root, conf
+        self.shortcut = shortcut
 
 
 INTERFACES = []                  # ordered list (CLI order == switcher order)
@@ -5660,7 +5768,8 @@ def build_registry(repo_roots):
         brand = conf.get("brand", {})
         name = brand.get("name") or os.path.basename(root)
         icon = brand.get("icon") or brand.get("favicon") or _DEF["icon"]
-        it = Interface(_slugify(os.path.basename(root), seen), name, icon, root, conf)
+        sc = str(conf.get("shortcut", "") or "").strip()
+        it = Interface(_slugify(os.path.basename(root), seen), name, icon, root, conf, sc)
         INTERFACES.append(it)
         _IFACE_BY_SLUG[it.slug] = it
     return INTERFACES
@@ -5679,36 +5788,149 @@ def activate(iface):
     apply_config(iface.conf)
 
 
+_REPO_URL = "https://github.com/aphoristicEpigram/interfacile"
+_FOOTER = (
+    "<footer id='ifc-foot'>made with "
+    "<a href='%s' target='_blank' rel='noopener'>interfacile</a>"
+    " &middot; <a href='%s' target='_blank' rel='noopener'>view source &amp; "
+    "contribute &nearr;</a></footer>"
+    "<style>#ifc-foot{margin:44px auto 24px;padding-top:18px;max-width:1100px;"
+    "text-align:center;font:500 12px/1.5 var(--font-sans,var(--font,system-ui));"
+    "color:var(--ink-mut,var(--mut,#8a8a8a));border-top:1px solid var(--line,#e2e2e2)}"
+    "#ifc-foot a{color:var(--accent-ink,var(--accent,#666));text-decoration:none;font-weight:600}"
+    "#ifc-foot a:hover{text-decoration:underline}</style>"
+    % (_REPO_URL, _REPO_URL)
+)
+
+_SWITCHER_CSS = """
+#ifc-bar{position:sticky;top:0;z-index:200;display:flex;align-items:center;gap:12px;
+padding:8px 18px;background:var(--surface,#fff);border-bottom:1px solid var(--line,#e2e2e2);
+box-shadow:0 1px 3px rgba(0,0,0,.05)}
+#ifc-actions{margin-left:auto;display:flex;align-items:center;gap:8px}
+#ifc-switch{position:relative}
+.ifc-i{margin-left:6px;font-size:1.02em}
+/* trigger */
+#ifc-cur{display:inline-flex;align-items:center;
+font:600 13px/1 var(--font-sans,var(--font,system-ui));color:var(--ink,#15202b);
+background:var(--surface-2,var(--surface2,#f4f4f6));border:1px solid var(--line,#d6dde5);
+border-radius:10px;padding:8px 11px;cursor:pointer;transition:border-color .14s,box-shadow .14s}
+#ifc-cur:hover{border-color:var(--accent,#888);box-shadow:0 1px 7px rgba(0,0,0,.07)}
+#ifc-cur[aria-expanded=true]{border-color:var(--accent,#888)}
+#ifc-cur .ifc-caret{color:var(--ink-mut,var(--mut,#888));font-size:10px;margin-left:8px;
+transition:transform .16s ease}
+#ifc-cur[aria-expanded=true] .ifc-caret{transform:rotate(180deg)}
+/* menu */
+#ifc-menu{position:absolute;top:calc(100% + 8px);left:0;min-width:252px;list-style:none;
+margin:0;padding:6px;background:var(--surface,#fff);border:1px solid var(--line,#d6dde5);
+border-radius:13px;box-shadow:0 16px 42px rgba(0,0,0,.24);z-index:300;transform-origin:top left;
+opacity:0;transform:translateY(-8px) scale(.985);visibility:hidden;pointer-events:none;
+transition:opacity .15s ease,transform .15s ease}
+#ifc-menu.open{opacity:1;transform:none;visibility:visible;pointer-events:auto}
+#ifc-menu .ifc-hd{padding:7px 10px 6px;font:700 10px/1 var(--font-sans,var(--font,system-ui));
+letter-spacing:.15em;text-transform:uppercase;color:var(--ink-mut,var(--mut,#8a8a8a))}
+#ifc-menu .ifc-hd:hover{background:transparent}
+#ifc-menu li{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:9px;
+cursor:pointer;transition:background .1s}
+#ifc-menu li .ifc-txt{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1 1 auto}
+#ifc-menu li .ifc-n{font:600 13px/1.15 var(--font-sans,var(--font,system-ui));
+color:var(--ink,#15202b);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#ifc-menu li .ifc-sub{font:500 11px/1 var(--font-mono,ui-monospace,SFMono-Regular,monospace);
+color:var(--ink-mut,var(--mut,#8a8a8a));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#ifc-menu li .ifc-kbd{flex:none;font:600 11px/1 var(--font-mono,ui-monospace,monospace);
+color:var(--ink-mut,var(--mut,#8a8a8a));background:var(--surface-2,var(--surface2,#f2f4f8));
+border:1px solid var(--line,#d6dde5);border-bottom-width:2px;border-radius:6px;
+padding:4px 7px;min-width:11px;text-align:center}
+#ifc-menu li .ifc-chk{flex:none;font-size:13px;opacity:0;
+color:var(--accent-ink,var(--accent,#0a7d6b))}
+#ifc-menu li:hover{background:var(--surface-2,var(--surface2,#f2f4f8))}
+#ifc-menu li[aria-selected=true]{background:var(--accent-soft,var(--surface2,#eef1ff))}
+#ifc-menu li[aria-selected=true] .ifc-chk{opacity:1}
+"""
+
+_SWITCHER_JS = """
+(function(){
+var cur=document.getElementById('ifc-cur'),menu=document.getElementById('ifc-menu');
+function set(o){if(!menu)return;menu.classList.toggle('open',o);
+cur.setAttribute('aria-expanded',o?'true':'false');}
+function go(slug){document.cookie='ifc='+encodeURIComponent(slug)+';path=/;max-age=31536000';
+location.href='/';}
+if(cur&&menu){
+cur.addEventListener('click',function(e){e.stopPropagation();set(!menu.classList.contains('open'));});
+menu.addEventListener('click',function(e){var li=e.target.closest('li[data-slug]');if(li)go(li.getAttribute('data-slug'));});
+document.addEventListener('click',function(){set(false);});
+}
+/* per-interface shortcut key switches from anywhere (ignored while typing) */
+var keymap={};
+if(menu)Array.prototype.forEach.call(menu.querySelectorAll('li[data-key]'),function(li){
+var k=li.getAttribute('data-key');if(k)keymap[k.toLowerCase()]=li.getAttribute('data-slug');});
+document.addEventListener('keydown',function(e){
+if(e.key==='Escape'){set(false);return;}
+if(e.ctrlKey||e.metaKey||e.altKey)return;
+var t=e.target,tn=t&&t.tagName;
+if(tn==='INPUT'||tn==='TEXTAREA'||tn==='SELECT'||(t&&t.isContentEditable))return;
+var slug=keymap[(e.key||'').toLowerCase()];
+if(slug){e.preventDefault();go(slug);}
+});
+/* clicking outside the notes/todo pop-out closes it */
+document.addEventListener('mousedown',function(e){
+var np=document.getElementById('notePanel');
+if(np&&!np.hidden&&!np.contains(e.target)&&!(e.target.closest&&e.target.closest('.notebtn'))){
+var c=document.getElementById('npClose');if(c)c.click();}
+});
+function relocate(){
+var acts=document.getElementById('ifc-actions');
+if(acts){var gh=document.getElementById('ghBtn'),rg=document.getElementById('regen');
+if(gh)acts.appendChild(gh);if(rg)acts.appendChild(rg);}
+var head=document.querySelector('.head-btns'),notes=document.querySelector('.note-btns');
+if(head&&notes){while(notes.firstChild)head.appendChild(notes.firstChild);
+notes.parentNode.removeChild(notes);}
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',relocate);
+else relocate();
+})();
+"""
+
+
 def _switcher_html():
-    """A centered, theme-styled interface dropdown, or '' for a single interface."""
+    """Top-left sticky bar: a designed downward interface dropdown on the left
+    (name + emoji + repo·prefix sub-label + shortcut keycap + active check), and a
+    right-hand slot into which the page's GitHub + Regenerate controls are
+    relocated by JS (notes + pin move up to the old GitHub spot). '' when there is
+    only one interface."""
     if len(INTERFACES) <= 1:
         return ""
-    opts = []
+    active = _IFACE_BY_SLUG.get(ACTIVE_SLUG) or INTERFACES[0]
+
+    def _sub(it):
+        pfx = (it.conf.get("ids", {}) or {}).get("prefix", "")
+        base = os.path.basename(it.root.rstrip("/"))
+        return html.escape(base + (" · " + pfx if pfx else ""))
+
+    def _name(it):  # project name, emoji AFTER it
+        return ("<span class='ifc-n'>%s<span class='ifc-i'>%s</span></span>"
+                % (html.escape(it.name), html.escape(it.icon or "")))
+
+    rows = []
     for it in INTERFACES:
-        sel = " selected" if it.slug == ACTIVE_SLUG else ""
-        label = html.escape(((it.icon + "  ") if it.icon else "") + it.name)
-        opts.append("<option value='%s'%s>%s</option>"
-                    % (html.escape(it.slug), sel, label))
-    arrow = ("url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "
-             "viewBox='0 0 12 12'%3E%3Cpath d='M2 4.5l4 4 4-4' fill='none' "
-             "stroke='%23888' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E\")")
+        kbd = ("<span class='ifc-kbd'>%s</span>" % html.escape(it.shortcut)) if it.shortcut else ""
+        rows.append(
+            "<li role='option' data-slug='%s'%s%s>"
+            "<span class='ifc-txt'>%s<span class='ifc-sub'>%s</span></span>%s"
+            "<span class='ifc-chk' aria-hidden='true'>&#10003;</span></li>"
+            % (html.escape(it.slug),
+               " data-key='%s'" % html.escape(it.shortcut) if it.shortcut else "",
+               " aria-selected='true'" if it.slug == ACTIVE_SLUG else "",
+               _name(it), _sub(it), kbd))
     return (
-        "<div id='ifc-switch'><select aria-label='Switch interface' "
-        "onchange=\"document.cookie='ifc='+encodeURIComponent(this.value)"
-        "+';path=/;max-age=31536000';location.href='/'\">" + "".join(opts)
-        + "</select></div><style>"
-        "#ifc-switch{position:fixed;top:9px;left:50%;transform:translateX(-50%);"
-        "z-index:2147483000}"
-        "#ifc-switch select{font:600 12.5px/1 var(--font-sans,var(--font,system-ui));"
-        "letter-spacing:.02em;color:var(--ink,#15202b);background:var(--surface,#fff);"
-        "border:1px solid var(--line,#d6dde5);border-radius:999px;"
-        "padding:7px 32px 7px 15px;box-shadow:0 2px 12px rgba(0,0,0,.14);"
-        "-webkit-appearance:none;appearance:none;cursor:pointer;max-width:60vw;"
-        "background-image:" + arrow + ";background-repeat:no-repeat;"
-        "background-position:right 13px center;background-size:11px}"
-        "#ifc-switch select:hover{border-color:var(--accent,#888)}"
-        "#ifc-switch select:focus-visible{outline:2px solid var(--accent,#888);"
-        "outline-offset:2px}</style>"
+        "<div id='ifc-bar'><div id='ifc-switch'>"
+        "<button id='ifc-cur' type='button' aria-haspopup='listbox' aria-expanded='false'>"
+        + _name(active)
+        + "<span class='ifc-caret' aria-hidden='true'>&#9662;</span></button>"
+        "<ul id='ifc-menu' role='listbox'>"
+        "<li class='ifc-hd' aria-hidden='true' style='cursor:default'>Switch interface</li>"
+        + "".join(rows) + "</ul>"
+        "</div><div id='ifc-actions'></div></div>"
+        "<style>" + _SWITCHER_CSS + "</style><script>" + _SWITCHER_JS + "</script>"
     )
 
 
@@ -5726,7 +5948,17 @@ def run(repo_roots, port=None, host="127.0.0.1", open_browser=True):
     activate(INTERFACES[0])       # startup default; each request re-activates
 
     p = port if port is not None else int(os.environ.get("PORT", SERVER_PORT))
-    url = "http://%s:%d/" % (host, p)
+    # Pretty, branded loopback host. Browsers resolve *.localhost to 127.0.0.1,
+    # so no /etc/hosts edit is needed; plain localhost is printed as a fallback.
+    loopback = host in ("127.0.0.1", "0.0.0.0", "localhost", "::1")
+    if loopback:
+        brand_host = ("interfacile.localhost" if len(INTERFACES) > 1
+                      else INTERFACES[0].slug + ".localhost")
+        url = "http://%s:%d/" % (brand_host, p)
+        plain = "http://localhost:%d/" % p
+    else:
+        url = "http://%s:%d/" % (host, p)
+        plain = None
     srv = ThreadingHTTPServer((host, p), Handler)
     if len(INTERFACES) > 1:
         print("interfacile hub  ->  %s" % url, flush=True)
@@ -5735,6 +5967,8 @@ def run(repo_roots, port=None, host="127.0.0.1", open_browser=True):
     else:
         print("%s · interfacile  ->  %s" % (BRAND, url), flush=True)
         print("scanning: " + TICKETS_DIR, flush=True)
+    if plain:
+        print("     also:  %s" % plain, flush=True)
     print("Ctrl-C to stop.", flush=True)
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()

@@ -1,0 +1,16 @@
+{
+  "brand": {
+    "name": "Example Board",
+    "favicon": "🧪",
+    "icon": "🧪",
+    "eyebrow": "Ticket portfolio · demo",
+    "tagline": "This demo is tracked as"
+  },
+  "ids": { "prefix": "EX", "digits": 4 },
+  "epics": {
+    "E001": { "title": "Core", "emoji": "🧱" },
+    "E002": { "title": "Interface", "emoji": "🎨" }
+  },
+  "theme": "violet-neon",
+  "server": { "port": 8789 }
+}
