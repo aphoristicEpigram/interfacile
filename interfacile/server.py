@@ -2087,7 +2087,7 @@ a.b-head-id{text-decoration:none}a.b-head-id:hover{text-decoration:underline}
 a.e-name{text-decoration:none;color:var(--ink)}a.e-name:hover{color:var(--accent-ink)}
 /* effort-remaining-by-epic bars — single series, direct-labeled */
 .ebars{margin-top:8px;display:flex;flex-direction:column;gap:7px}
-.ebar-row{display:grid;grid-template-columns:170px 1fr;gap:10px;align-items:center;text-decoration:none;color:inherit;border-radius:5px;padding:2px 4px}
+.ebar-row{display:grid;grid-template-columns:170px minmax(0,1fr);gap:10px;align-items:center;text-decoration:none;color:inherit;border-radius:5px;padding:2px 4px;overflow:hidden}
 a.ebar-row:hover{background:var(--surface-2)}
 a.ebar-row:hover .ebr-name{color:var(--accent-ink)}
 .ebr-name{font-size:.76rem;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:right}
@@ -2116,7 +2116,7 @@ padding:10px 14px;border-bottom:1px solid var(--line-2);background:var(--surface
 .ctable th:first-child,.ctable td:first-child{text-align:left}
 .ctable th{position:sticky;top:0;background:var(--surface-2);color:var(--ink-mut);font-weight:600}
 .chart .tv{margin-left:auto}
-@media (max-width:720px){.ebar-row{grid-template-columns:120px 1fr}}
+@media (max-width:720px){.ebar-row{grid-template-columns:120px minmax(0,1fr)}}
 /* global jump-to search */
 .gsearch-row{position:relative;margin-top:18px}
 .gsearch{width:100%;font-family:var(--font-mono);font-size:.88rem;color:var(--ink);background:var(--surface-2);
@@ -3164,7 +3164,7 @@ section.collapsed .sec-head{margin-bottom:0}
     var max=top[0].dd||1;
     host.innerHTML='<div class="ebars">'+top.map(function(r){
       var inner='<span class="ebr-name">'+(r.emo?r.emo+" ":"")+(r.id?'<b>'+r.id+'</b> ':'')+esc(r.title)+'</span>'+
-        '<span class="ebr-track"><span class="ebr-bar" style="width:'+Math.max(1.5,r.dd/max*82)+'%"></span>'+
+        '<span class="ebr-track"><span class="ebr-bar" style="width:'+Math.max(1.5,r.dd/max*76)+'%"></span>'+
         '<span class="ebr-val">'+r.dd.toLocaleString()+'d</span></span>';
       return r.id?'<a class="ebar-row" href="/epic/'+r.id+'" title="open the '+r.id+' epic page">'+inner+'</a>'
                  :'<div class="ebar-row">'+inner+'</div>';
@@ -5662,7 +5662,8 @@ def _transform_html(s):
         s = s.replace("</head>", "<style>" + THEME_OVERRIDE_CSS + "</style></head>", 1)
     s = s.replace("</body>", _FOOTER + "</body>", 1)
     if len(INTERFACES) > 1:
-        s = _BODY_OPEN_RE.sub(lambda m: m.group(1) + _switcher_html(), s, count=1)
+        is_dash = 'id="regen"' in s          # the dashboard has the Regenerate button
+        s = _BODY_OPEN_RE.sub(lambda m: m.group(1) + _switcher_html(is_dash), s, count=1)
     return s
 
 
@@ -5789,23 +5790,34 @@ def activate(iface):
 
 
 _REPO_URL = "https://github.com/aphoristicEpigram/interfacile"
+_GH_PATH = ("M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 "
+            "0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13"
+            "-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66"
+            ".07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15"
+            "-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 "
+            "1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 "
+            "1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 "
+            "1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z")
 _FOOTER = (
-    "<footer id='ifc-foot'>made with "
-    "<a href='%s' target='_blank' rel='noopener'>interfacile</a>"
-    " &middot; <a href='%s' target='_blank' rel='noopener'>view source &amp; "
-    "contribute &nearr;</a></footer>"
-    "<style>#ifc-foot{margin:44px auto 24px;padding-top:18px;max-width:1100px;"
-    "text-align:center;font:500 12px/1.5 var(--font-sans,var(--font,system-ui));"
-    "color:var(--ink-mut,var(--mut,#8a8a8a));border-top:1px solid var(--line,#e2e2e2)}"
-    "#ifc-foot a{color:var(--accent-ink,var(--accent,#666));text-decoration:none;font-weight:600}"
-    "#ifc-foot a:hover{text-decoration:underline}</style>"
-    % (_REPO_URL, _REPO_URL)
+    "<div id='ifc-foot'>"
+    "<a href='%s' target='_blank' rel='noopener' title='interfacile on GitHub'>"
+    "<svg viewBox='0 0 16 16' aria-hidden='true'><path fill='currentColor' d='%s'/></svg>"
+    "</a><span>made with love \U0001FA77</span></div>"
+    "<style>body:has(.page){background:var(--ground)}"
+    "#ifc-foot{display:flex;align-items:center;justify-content:center;gap:7px;"
+    "margin:14px 0 30px;font:500 11.5px/1 var(--font-sans,var(--font,system-ui));"
+    "color:var(--ink-mut,var(--mut,#8a8a8a));opacity:.8}"
+    "#ifc-foot a{display:inline-flex;color:inherit;text-decoration:none}"
+    "#ifc-foot a:hover{color:var(--accent,#666)}"
+    "#ifc-foot svg{width:14px;height:14px;display:block}</style>"
+    % (_REPO_URL, _GH_PATH)
 )
 
 _SWITCHER_CSS = """
-#ifc-bar{position:sticky;top:0;z-index:200;display:flex;align-items:center;gap:12px;
+body{padding-top:52px}
+#ifc-bar{position:fixed;top:0;left:0;right:0;z-index:200;display:flex;align-items:center;gap:12px;
 padding:8px 18px;background:var(--surface,#fff);border-bottom:1px solid var(--line,#e2e2e2);
-box-shadow:0 1px 3px rgba(0,0,0,.05)}
+box-shadow:0 1px 3px rgba(0,0,0,.06)}
 #ifc-actions{margin-left:auto;display:flex;align-items:center;gap:8px}
 #ifc-switch{position:relative}
 .ifc-i{margin-left:6px;font-size:1.02em}
@@ -5845,6 +5857,14 @@ color:var(--accent-ink,var(--accent,#0a7d6b))}
 #ifc-menu li:hover{background:var(--surface-2,var(--surface2,#f2f4f8))}
 #ifc-menu li[aria-selected=true]{background:var(--accent-soft,var(--surface2,#eef1ff))}
 #ifc-menu li[aria-selected=true] .ifc-chk{opacity:1}
+/* prominent back-to-dashboard on sub-pages (switcher stays leftmost & fixed) */
+#ifc-home{display:inline-flex;align-items:center;gap:6px;
+font:600 12.5px/1 var(--font-sans,var(--font,system-ui));text-decoration:none;
+color:var(--accent-ink,var(--accent,#0a7d6b));
+background:var(--accent-soft,var(--surface-2,var(--surface2,#eef1ff)));
+border:1px solid var(--accent,#88a);border-radius:9px;padding:8px 13px;
+transition:background .12s,color .12s}
+#ifc-home:hover{background:var(--accent,#88a);color:var(--surface,#fff)}
 """
 
 _SWITCHER_JS = """
@@ -5891,14 +5911,16 @@ else relocate();
 """
 
 
-def _switcher_html():
-    """Top-left sticky bar: a designed downward interface dropdown on the left
-    (name + emoji + repo·prefix sub-label + shortcut keycap + active check), and a
-    right-hand slot into which the page's GitHub + Regenerate controls are
-    relocated by JS (notes + pin move up to the old GitHub spot). '' when there is
-    only one interface."""
+def _switcher_html(is_dash=True):
+    """Top-left sticky bar, identical on every page so nothing jumps around: the
+    interface dropdown is always leftmost, then (on non-dashboard pages) a
+    prominent "← Dashboard" button back to *this* interface's board, then a
+    right-hand slot for the page's GitHub + Regenerate controls (relocated by JS).
+    '' when there is only one interface."""
     if len(INTERFACES) <= 1:
         return ""
+    home = ("" if is_dash else
+            "<a id='ifc-home' href='/' title='Back to dashboard'>&larr; Dashboard</a>")
     active = _IFACE_BY_SLUG.get(ACTIVE_SLUG) or INTERFACES[0]
 
     def _sub(it):
@@ -5929,7 +5951,7 @@ def _switcher_html():
         "<ul id='ifc-menu' role='listbox'>"
         "<li class='ifc-hd' aria-hidden='true' style='cursor:default'>Switch interface</li>"
         + "".join(rows) + "</ul>"
-        "</div><div id='ifc-actions'></div></div>"
+        "</div>" + home + "<div id='ifc-actions'></div></div>"
         "<style>" + _SWITCHER_CSS + "</style><script>" + _SWITCHER_JS + "</script>"
     )
 

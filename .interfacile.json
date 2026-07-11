@@ -11,7 +11,11 @@
     "E001": { "title": "Consolidation & Config", "emoji": "🧩" },
     "E002": { "title": "Packaging & CLI", "emoji": "📦" },
     "E003": { "title": "Multi-interface Hub", "emoji": "🛰️" },
-    "E004": { "title": "Onboarding", "emoji": "🚀" }
+    "E004": { "title": "Onboarding", "emoji": "🚀" },
+    "E005": { "title": "Distribution & Release", "emoji": "🚢" },
+    "E006": { "title": "Ticket Workflow", "emoji": "✍️" },
+    "E007": { "title": "Dashboard UX", "emoji": "✨" },
+    "E008": { "title": "Team & Hosting", "emoji": "👥" }
   },
   "theme": {
     "name": "acid",
