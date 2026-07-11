@@ -1,0 +1,23 @@
+{
+  "brand": {
+    "name": "They're Here",
+    "favicon": "🛸",
+    "icon": "🛸",
+    "eyebrow": "Ticket portfolio · engineering program",
+    "tagline": "This project is tracked as"
+  },
+  "ids": {
+    "prefix": "TH",
+    "digits": 4
+  },
+  "epics": {
+    "E001": { "title": "Airtable → Supabase Sync", "emoji": "🔄" },
+    "E002": { "title": "Media Pipeline → R2", "emoji": "🖼️" },
+    "E003": { "title": "Printful Variants & Mockups", "emoji": "👕" },
+    "E004": { "title": "Website", "emoji": "🌐" }
+  },
+  "theme": "violet-neon",
+  "server": {
+    "port": 8788
+  }
+}

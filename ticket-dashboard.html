@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Clean Paste · Dashboard launcher</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎟️</text></svg>">
+<style>
+  :root{
+    --bg:#e9edf1;--card:#fff;--ink:#101720;--mut:#5d6a77;--line:#d6dde5;--accent:#2b53e6;
+    --code:#f3f6f9;--font:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){:root{--bg:#0b0f15;--card:#141b25;--ink:#e8edf3;--mut:#8b98a6;
+    --line:#26313e;--accent:#6a8dff;--code:#0f1620;}}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);
+    font-family:var(--font);padding:24px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;max-width:520px;width:100%;
+    padding:30px 32px;box-shadow:0 12px 40px -18px rgba(0,0,0,.35)}
+  .eyebrow{font-family:var(--mono);font-size:.7rem;letter-spacing:.16em;text-transform:uppercase;color:var(--mut)}
+  h1{font-size:1.5rem;letter-spacing:-.02em;margin:.35em 0 .2em}
+  p{color:var(--mut);line-height:1.55;margin:.6em 0}
+  a.go{display:inline-flex;align-items:center;gap:8px;margin:14px 0 4px;background:var(--accent);color:#fff;
+    text-decoration:none;font-weight:600;font-size:.95rem;padding:11px 20px;border-radius:9px}
+  a.go:hover{filter:brightness(1.07)}
+  code,pre{font-family:var(--mono);font-size:.82rem}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:9px;padding:12px 14px;overflow-x:auto;color:var(--ink)}
+  .status{font-family:var(--mono);font-size:.76rem;margin-top:10px;color:var(--mut)}
+  .status.up{color:#2f9e5b}
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="eyebrow">Ticket dashboard launcher</div>
+    <h1>Clean Paste</h1>
+    <p>Live status of the <code>tickets/</code> tree, with click-through to each ticket's YAML and in-browser editing. Served by a local Python process — no dependencies.</p>
+    <p><strong>1.</strong> Start the server from the repo root:</p>
+    <pre>python scripts/dev/ticket_report_server.py</pre>
+    <p><strong>2.</strong> Then open it:</p>
+    <a class="go" href="http://127.0.0.1:8787/">Open dashboard&nbsp;&rarr;</a>
+    <div class="status" id="status">checking for a running server on :8787&hellip;</div>
+  </main>
+  <script>
+    // If the server is already up, jump straight to it. fetch(no-cors) resolves for a
+    // reachable host even cross-origin; a failure just means "not running yet".
+    fetch("http://127.0.0.1:8787/favicon.ico", {mode: "no-cors", cache: "no-store"})
+      .then(function(){
+        var s = document.getElementById("status");
+        s.textContent = "server is up — redirecting…";
+        s.className = "status up";
+        setTimeout(function(){ location.href = "http://127.0.0.1:8787/"; }, 500);
+      })
+      .catch(function(){
+        document.getElementById("status").textContent = "server not running yet — start it, then click Open.";
+      });
+  </script>
+</body>
+</html>

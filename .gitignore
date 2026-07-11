@@ -5,3 +5,10 @@ __pycache__/
 *.log
 progress*.json
 .DS_Store
+
+# Per-repo runtime state the dashboard/hygiene engine writes (regenerated on use)
+.ticket-pins.json
+.ticket_hygiene_last_run
+.ticket_hygiene_baseline.json
+.scratchpad.md
+.todo.md

@@ -1,0 +1,133 @@
+#!/bin/bash
+# commit-msg hook: ceremony enforcement
+# Install: cp scripts/git-hooks/commit-msg .git/hooks/commit-msg && chmod +x .git/hooks/commit-msg
+#
+# Blocks commits that are actually closing tickets unless the message contains BOTH:
+#   - "Ceremony:"
+#   - "Approved:"
+# And all staged closed ticket files contain "If I Had 3 More Hours"
+# (except retro_exempt or WONT_FIX tickets).
+#
+# A "closing" commit is one where:
+#   - a file is renamed/moved from open/ to closed/ (same basename), OR
+#   - a file is deleted from open/ and added to closed/, OR
+#   - a closed/ file is modified to add status: CLOSED.
+# Post-closure edits (BONUS sections, typo fixes) do not trigger this check.
+
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+
+# Determine if this commit is actually closing a ticket.
+STAGED_DIFF=$(git diff --cached --name-status)
+
+IS_CLOSING=false
+
+# 1. Renames from open/ to closed/
+while IFS=$'\t' read -r status src dst; do
+    if [[ "$status" == R* ]]; then
+        if [[ "$src" == */open/*.md && "$dst" == */closed/*.md ]]; then
+            src_base=$(basename "$src")
+            dst_base=$(basename "$dst")
+            if [ "$src_base" = "$dst_base" ]; then
+                IS_CLOSING=true
+                break
+            fi
+        fi
+    fi
+done <<< "$STAGED_DIFF"
+
+# 2. Delete from open/ + add to closed/
+if [ "$IS_CLOSING" != "true" ]; then
+    OPEN_DELETED=$(echo "$STAGED_DIFF" | awk -F'\t' '$1 == "D" && $2 ~ /\/open\/.*\.md$/ { print $2 }' | while read -r f; do basename "$f"; done | sort -u)
+    CLOSED_ADDED=$(echo "$STAGED_DIFF" | awk -F'\t' '$1 == "A" && $2 ~ /\/closed\/.*\.md$/ { print $2 }' | while read -r f; do basename "$f"; done | sort -u)
+    if [ -n "$OPEN_DELETED" ] && [ -n "$CLOSED_ADDED" ]; then
+        MATCHES=$(comm -12 <(echo "$OPEN_DELETED") <(echo "$CLOSED_ADDED"))
+        if [ -n "$MATCHES" ]; then
+            IS_CLOSING=true
+        fi
+    fi
+fi
+
+# 3. Closed file gaining status: CLOSED
+if [ "$IS_CLOSING" != "true" ]; then
+    CLOSED_MODIFIED=$(echo "$STAGED_DIFF" | awk -F'\t' '$1 == "M" && $2 ~ /\/closed\/.*\.md$/ { print $2 }')
+    if [ -n "$CLOSED_MODIFIED" ]; then
+        for f in $CLOSED_MODIFIED; do
+            if git diff --cached --unified=0 -- "$f" 2>/dev/null | grep -qE '^\+status:\s*CLOSED'; then
+                IS_CLOSING=true
+                break
+            fi
+        done
+    fi
+fi
+
+if [ "$IS_CLOSING" != "true" ]; then
+    # Not a closure ceremony — no enforcement needed.
+    exit 0
+fi
+
+STAGED_CLOSED=$(git diff --cached --name-only | grep -E "closed/.*\.md$" || true)
+
+# 1. Must contain "Ceremony:"
+if ! grep -q "Ceremony:" "$COMMIT_MSG_FILE"; then
+    echo ""
+    echo "ERROR: Commit closes a ticket but message lacks 'Ceremony:'"
+    echo "$STAGED_CLOSED" | while read f; do echo "  - $f"; done
+    echo ""
+    echo "EM-1146 ceremony is REQUIRED. Steps:"
+    echo "  1. Verify work (tests pass, mypy clean)"
+    echo "  2. Write retro in ticket file (including 'If I Had 3 More Hours')"
+    echo "  3. POST ENTIRE RETRO IN CHAT"
+    echo "  4. AWAIT HUMAN APPROVAL before committing"
+    echo "  5. Update frontmatter: status: CLOSED, closed: YYYY-MM-DD"
+    echo "  6. Move file: open/ -> closed/"
+    echo "  7. Regenerate TICKET_INDEX.md"
+    echo "  8. Commit with BOTH 'Ceremony:' AND 'Approved:' in the message"
+    echo ""
+    echo "Add 'Ceremony: <retro summary>' and 'Approved: <approver>' to your commit message and retry."
+    exit 1
+fi
+
+# 2. Must contain "Approved:"
+if ! grep -q "Approved:" "$COMMIT_MSG_FILE"; then
+    echo ""
+    echo "ERROR: Commit closes a ticket but message lacks 'Approved:'"
+    echo "$STAGED_CLOSED" | while read f; do echo "  - $f"; done
+    echo ""
+    echo "EM-1146 Step 3b: You MUST await human approval before committing a closed ticket."
+    echo "Post the retro in chat, wait for explicit approval, then include 'Approved:' in the commit message."
+    echo ""
+    echo "Add 'Approved: <who approved>' to your commit message and retry."
+    exit 1
+fi
+
+# 3. Staged closed/ .md files MUST contain "If I Had 3 More Hours" in their retro
+#    Exception: files with retro_exempt, retro_in, or WONT_FIX status are skipped
+echo "$STAGED_CLOSED" | while read f; do
+    if [ -f "$f" ]; then
+        if grep -q "retro_exempt" "$f" || grep -q "retro_in" "$f"; then
+            continue
+        fi
+        if grep -q "status: WONT_FIX" "$f"; then
+            continue
+        fi
+        if ! grep -qi "If I Had 3 More Hours" "$f"; then
+            echo ""
+            echo "ERROR: Ticket file is missing required retro section: 'If I Had 3 More Hours'"
+            echo "  File: $f"
+            echo ""
+            echo "EM-1146 requires this section in EVERY retro. It is non-negotiable."
+            echo "Add the section or set retro_exempt: true in frontmatter and retry."
+            exit 1
+        fi
+    fi
+done
+
+echo ""
+echo "=== CEREMONY COMPLETE ==="
+echo "Commit closes a ticket and contains 'Ceremony:' and 'Approved:'."
+echo "All staged closed ticket files contain 'If I Had 3 More Hours'."
+echo "HALT. Do not proceed to the next ticket."
+echo "Await explicit human instruction before continuing."
+echo "========================="
