@@ -1,6 +1,8 @@
-# `interfacile.json` — per-repo config
+# `.interfacile.json` — per-repo config
 
-Drop one `interfacile.json` at a consuming repo's root (next to its `tickets/`).
+Drop one `.interfacile.json` (hidden dotfile) at a consuming repo's root (next to
+its `tickets/`). A visible `interfacile.json` also works as a fallback, but the
+hidden name is preferred so it stays out of the way at the repo root.
 The engine reads it on startup; **every field is optional** and falls back to a
 sensible default, so a repo with no config file behaves exactly as the engine's
 built-in defaults. Nothing about a project's *content* lives here — tickets,

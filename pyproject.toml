@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "interfacile"
+version = "0.1.0"
+description = "One portable engine that turns a folder of markdown tickets into a live, themeable project-portfolio interface — many interfaces, one switchable hub."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+interfacile = "interfacile.cli:main"
+
+[tool.setuptools]
+packages = ["interfacile"]
