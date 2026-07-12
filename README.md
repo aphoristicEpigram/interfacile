@@ -20,8 +20,9 @@ request, so you edit a ticket, refresh, and it's there.
 **One engine, many interfaces.** A single install drives the dashboard for any
 number of repos — each with its own id prefix, brand, theme, and keyboard
 shortcut — switchable from **one hub** via a top-bar dropdown. Every project's
-tickets, scratchpad, and todos stay in its own repo; a small `.interfacile.json`
-describes how its interface looks.
+tickets stay in its own repo, and everything interfacile needs lives in one
+hidden `.interfacile/` folder — a small `config.json` describes how the interface
+looks, alongside the (git-ignored) scratchpad, to-do, and pin state.
 
 > interfacile is built with interfacile — this repo tracks its own work in
 > [`tickets/`](tickets/), so `cd interfacile && interfacile` shows the board
@@ -43,31 +44,118 @@ describes how its interface looks.
 
 ## Install
 
+You run `interfacile` from *inside other repos*, so the command has to work from
+**any** folder. That means getting it onto your `PATH` — do this **once, ever**.
+
+**Step 1 — get the code.**
+
 ```bash
-# from source (PyPI packaging is on the roadmap):
 git clone https://github.com/aphoristicEpigram/interfacile
 cd interfacile
-pipx install .            # recommended — or:  pip install -e .
 ```
 
-That puts an `interfacile` command on your PATH. Requires Python 3.8+.
+**Step 2 — install it. Pick ONE route.**
 
-## Quick start
+*Route A — `pipx`* (cleanest, but only if you already have `pipx`):
 
-**Turn any repo into an interface — one command:**
+```bash
+pipx install .
+```
+
+*Route B — venv + symlink* (no extra tools needed; works on a stock Mac):
+
+```bash
+python3 -m venv venv
+./venv/bin/pip install -e .
+sudo ln -s "$PWD/venv/bin/interfacile" /usr/local/bin/interfacile
+```
+
+**Step 3 — prove it worked.** Move somewhere else on purpose, then run it:
+
+```bash
+cd ~
+interfacile --version
+```
+
+A version number means you're done. `command not found` means Step 2 didn't take
+— see **[Troubleshooting](#troubleshooting)**.
+
+> ### The one trap ⚠️
+>
+> Running `pip install -e .` **with a venv active** installs `interfacile` into
+> *that venv only*. Switch to another project (with its own venv) and the command
+> vanishes:
+>
+> ```
+> zsh: command not found: interfacile
+> ```
+>
+> This is the single most likely way to get stuck, and it looks like a broken
+> install when it isn't. Route B's `ln -s` is what prevents it: the symlink points
+> at the venv's launcher script, which hard-codes its own Python in the shebang —
+> so it runs correctly from any directory, with any venv active, or none at all.
+
+Requires Python 3.8+. No runtime dependencies.
+
+## Quick start — add a repo to the dashboard
+
+> **Install interfacile first (above).** `interfacile init` is a command *you*
+> run inside your project; it is not something your project provides. If it says
+> `command not found`, you skipped the install.
+
+**1. Go to the repo you want a dashboard for.**
 
 ```bash
 cd /path/to/your-repo
-interfacile init          # writes .interfacile.json, seeds a starter tickets/
-                          # tree if none exists, and registers the repo
-interfacile               # serve the current directory → opens your browser
 ```
 
-`init` guesses the id prefix from existing tickets (e.g. `TH-0004` → `TH`),
-otherwise from the folder name. Edit the generated `.interfacile.json` to set the
-brand, favicon, epics, theme, and shortcut.
+**2. Set it up.**
 
-**Just want to look around first?** Serve the bundled demo:
+```bash
+interfacile init
+```
+
+That single command does everything:
+
+- writes `.interfacile/config.json`
+- seeds a starter `tickets/` tree, if the repo hasn't got one
+- adds the `.gitignore` rules
+- registers the repo with the hub
+
+It is **safe to re-run** — an existing config, registration, and ignore rule are
+all left alone.
+
+**3. Look at it.**
+
+```bash
+interfacile          # serves this repo, opens your browser
+```
+
+**4. Add it to your hub.** The hub reads the registry **at startup**, so a newly
+`init`-ed repo only shows up in the switcher after you **restart** it:
+
+```bash
+interfacile hub
+```
+
+**5. Make it yours (optional).** Edit the generated `.interfacile/config.json` to
+set the brand name, favicon, epics, theme, `shortcut` (give each repo a distinct
+key), and `server.port` (give each repo a distinct port). See
+[Configuring an interface](#configuring-an-interface).
+
+### What `init` decides for you
+
+`init` guesses the id prefix from existing tickets (e.g. `TH-0004` → `TH`),
+otherwise from the folder name. It also appends these lines to the repo's
+`.gitignore`, so the config is committed while the state the dashboard writes
+(pins, scratchpad, to-do) stays local and private:
+
+```gitignore
+.interfacile/*
+!.interfacile/config.json
+```
+
+**Just want to look around first?** Serve the bundled demo — no setup, no repo:
 
 ```bash
 interfacile serve --repo examples     # a self-contained EX- demo board
@@ -97,16 +185,29 @@ config to jump straight to it from anywhere.
 
 ## Configuring an interface
 
-A hidden `.interfacile.json` at a repo root controls that interface:
+A hidden `.interfacile/config.json` at a repo root controls that interface:
 
 | Field | What it sets |
 |---|---|
 | `brand` | `name`, `favicon`, `icon`, `eyebrow`, `tagline` |
 | `ids` | `prefix` (drives all id patterns) and `digits` |
 | `epics` | per-epic titles + emoji |
+| `links` | quick links in the header (`emoji`, `title`, `url`) |
 | `theme` | a preset name, or a full custom palette |
 | `shortcut` | a key that switches to this interface from anywhere |
 | `server.port` | default port |
+
+**Quick links** — add a `links` list to put your own buttons in the header, next
+to the pin/scratchpad. Each is `{ "emoji", "title", "url" }`; add as many as you
+want, in any order. `emoji` is optional (defaults to 🔗) and hovering a button
+shows its `title`:
+
+```json
+"links": [
+  { "emoji": "⚙️", "title": "Backend",         "url": "https://github.com/acme/api" },
+  { "emoji": "🚀", "title": "Live application", "url": "https://app.acme.com" }
+]
+```
 
 **Themes** — 14 built-in presets, each with its own background:
 `blue`, `violet-neon`, `green`, `forest`, `teal`, `cyan`, `indigo`, `violet`,
@@ -141,6 +242,47 @@ ticket's real state is its `status:` field. See a live example under
 The repo also carries a ticket **hygiene** engine
 ([`scripts/ticket_hygiene/`](scripts/ticket_hygiene/) — lint, audit, index,
 health) and optional **git hooks** ([`scripts/git-hooks/`](scripts/git-hooks/)).
+
+## Troubleshooting
+
+### `zsh: command not found: interfacile`
+
+interfacile isn't on your `PATH`. Almost always this means it was installed into
+**one project's venv** instead of globally (see [The one trap](#the-one-trap-)).
+
+Find out whether it exists at all:
+
+```bash
+which -a interfacile
+```
+
+**Nothing printed** → it was never installed. Do the [Install](#install) steps.
+
+**It printed a path ending in `/venv/bin/interfacile`** → it's installed, just
+trapped inside that venv. Symlink it out, and it'll work everywhere:
+
+```bash
+sudo ln -s /full/path/to/interfacile/venv/bin/interfacile /usr/local/bin/interfacile
+```
+
+### `command not found: pipx`
+
+You don't have `pipx`, and you don't need it. Use **Route B** in
+[Install](#install) instead — venv + symlink, no extra tools.
+
+### My new repo isn't in the hub's switcher
+
+The hub reads the registry **once, at startup**. **Restart `interfacile hub`.**
+Confirm the repo actually registered with:
+
+```bash
+interfacile list
+```
+
+### `interfacile: no repos with a tickets/ folder to serve`
+
+interfacile only serves a repo that has a `tickets/` directory. Run
+`interfacile init` in it — that seeds a starter one for you.
 
 ## How it works
 

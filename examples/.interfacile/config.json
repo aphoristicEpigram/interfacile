@@ -11,6 +11,12 @@
     "E001": { "title": "Core", "emoji": "🧱" },
     "E002": { "title": "Interface", "emoji": "🎨" }
   },
+  "links": [
+    { "emoji": "⚙️", "title": "Backend repo", "url": "https://github.com/example-org/example-backend" },
+    { "emoji": "🎨", "title": "Frontend repo", "url": "https://github.com/example-org/example-frontend" },
+    { "emoji": "🚀", "title": "Live application", "url": "https://example-board.example.com" },
+    { "title": "Status page", "url": "https://status.example.com" }
+  ],
   "theme": "violet-neon",
   "server": { "port": 8789 }
 }

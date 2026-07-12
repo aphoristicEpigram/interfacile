@@ -25,7 +25,7 @@ running server and redirects, otherwise it shows the start command.
   resolved-percentage meter.
 - **Pinned · watching** — bookmark tickets to come back to. Pin/unpin with the 🔖 button at
   the top of any ticket page (or ✕ unpin in the panel). Pins survive closure and live in
-  `.ticket-pins.json` at the repo root (git-ignored UI state, never touches ticket files).
+  `.interfacile/pins.json` (git-ignored UI state, never touches ticket files).
 - **Work in progress** — every ticket whose file is modified/untracked in the git working
   tree, most recently touched first.
 - **Epic breakdown** — one proportional bar per epic (closed / open / won't-fix), sortable by
@@ -67,6 +67,6 @@ only primary (non-`index_exempt`) tickets. Open counts agree between the two.
 | `GET` | `/ticket/<id>` | Rendered ticket detail + editor |
 | `GET` | `/filter?…` | Cross-epic ticket list. One `status` renders a full-width card grid; several stack open → closed → won't-fix. Extra params: `wip=1`, `pinned=1` |
 | `POST` | `/api/save` | Write a ticket file — body `{"id", "content"}`; refuses paths outside `tickets/` |
-| `POST` | `/api/pin` | Pin/unpin a ticket — body `{"id", "pinned"}`; state kept in `.ticket-pins.json` |
+| `POST` | `/api/pin` | Pin/unpin a ticket — body `{"id", "pinned"}`; state kept in `.interfacile/pins.json` |
 
 It binds to `127.0.0.1` only. Because `/api/save` writes to disk, don't expose it beyond localhost.

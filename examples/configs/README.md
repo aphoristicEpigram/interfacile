@@ -1,15 +1,21 @@
-# `.interfacile.json` — per-repo config
+# `.interfacile/config.json` — per-repo config
 
-Drop one `.interfacile.json` (hidden dotfile) at a consuming repo's root (next to
-its `tickets/`). A visible `interfacile.json` also works as a fallback, but the
-hidden name is preferred so it stays out of the way at the repo root.
-The engine reads it on startup; **every field is optional** and falls back to a
-sensible default, so a repo with no config file behaves exactly as the engine's
-built-in defaults. Nothing about a project's *content* lives here — tickets,
-scratchpad, and todos always stay in the repo. This file only describes how that
-repo's interface looks and what id scheme it uses.
+Everything interfacile needs lives in a hidden `.interfacile/` folder at a
+consuming repo's root (next to its `tickets/`). The config is
+`.interfacile/config.json` — the only committed file in that folder; the pins,
+scratchpad, and to-do it writes alongside are git-ignored runtime state.
+The engine reads the config on startup; **every field is optional** and falls
+back to a sensible default, so a repo with no config file behaves exactly as the
+engine's built-in defaults. Nothing about a project's *content* lives here —
+tickets stay in the repo. This file only describes how that repo's interface
+looks and what id scheme it uses.
 
-Two ready-made examples in this folder reproduce the current look of each board:
+> **Moving from an older layout?** The config used to be a flat `.interfacile.json`
+> at the repo root. Move it to `.interfacile/config.json` — the root dotfile is no
+> longer read.
+
+Two ready-made examples in this folder reproduce the current look of each board —
+copy either into your repo as `.interfacile/config.json`:
 
 | File | Reproduces |
 |---|---|
@@ -23,7 +29,7 @@ Two ready-made examples in this folder reproduce the current look of each board:
 |---|---|
 | `name` | The `<h1>` title and the name used across page titles. |
 | `favicon` | Emoji rendered into the **browser-tab** icon (an inline SVG). |
-| `icon` | Emoji (or, later, an image path) shown as a **mark beside the title** in the header. Defaults to `favicon`. |
+| `icon` | Emoji shown as a **mark right after the title** in the header (e.g. *interfacile 🧩*). Defaults to `favicon`. |
 | `eyebrow` | The small uppercased kicker above the title. |
 | `tagline` | Lead-in of the summary sentence, e.g. *"This project is tracked as **N tickets** across …"*. |
 
@@ -37,6 +43,33 @@ Two ready-made examples in this folder reproduce the current look of each board:
 Map of epic code (`E###`, the part after `PREFIX-E`) → `{ "title", "emoji" }`.
 Unknown codes fall back to the bare code and a default emoji, so this is optional
 but it's what makes the epic pages read nicely.
+
+### `links` (optional)
+Per-project quick links, rendered as small emoji buttons in the header row next
+to the pin/scratchpad. It's a **list**, so add as many as you like, in the order
+you want them. Each link is an object with three fields:
+
+| Field | Meaning |
+|---|---|
+| `emoji` | The glyph on the button. **Optional** — defaults to 🔗 if you leave it out. |
+| `title` | Shown as a hover overlay so you can see where the link goes. Falls back to the URL if omitted. |
+| `url` | Where the link points (opens in a new tab). **Required** — a link with no `url` is skipped. |
+
+There's no fixed set and nothing is hard-coded: the buttons are exactly the
+links you list, in your order.
+
+```json
+"links": [
+  { "emoji": "⚙️", "title": "Backend",         "url": "https://github.com/acme/api" },
+  { "emoji": "🎨", "title": "Frontend",        "url": "https://github.com/acme/web" },
+  { "emoji": "🚀", "title": "Live application", "url": "https://app.acme.com" },
+  { "emoji": "📈", "title": "Analytics",        "url": "https://analytics.acme.com" },
+  {                "title": "Status page",      "url": "https://status.acme.com" }
+]
+```
+
+The last entry above omits `emoji`, so it renders with the default 🔗. Hover any
+button to see its `title`.
 
 ### `theme`
 Either the **name of a built-in preset**, or an **inline palette object**. Each
@@ -95,6 +128,6 @@ distinct key (digits are safest).
 
 ## Precedence
 
-`--repo` / CLI flags  ▸  `interfacile.json`  ▸  built-in defaults. A missing file,
-a missing section, or a missing key each fall back to the level below, so you can
-start with a two-line config and grow it.
+`--repo` / CLI flags  ▸  `.interfacile/config.json`  ▸  built-in defaults. A
+missing file, a missing section, or a missing key each fall back to the level
+below, so you can start with a two-line config and grow it.

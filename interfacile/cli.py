@@ -5,7 +5,7 @@
     interfacile hub    [--repo P ...] serve several repos with a switcher
                                       (no --repo => every registered interface)
 
-    interfacile init   [PATH]         scaffold a repo's .interfacile.json + register it
+    interfacile init   [PATH]         scaffold a repo's .interfacile/config.json + register it
     interfacile register   [PATH]     add a repo to the hub registry
     interfacile unregister [PATH]     remove a repo from the registry
     interfacile list                  list registered interfaces
@@ -111,6 +111,33 @@ def _write(path, text):
         fh.write(text)
 
 
+_GITIGNORE_BLOCK = (
+    "# interfacile: commit the config, ignore the runtime state it writes\n"
+    "# (pins, scratchpad, to-do)\n"
+    ".interfacile/*\n"
+    "!.interfacile/config.json\n"
+)
+
+
+def _ensure_gitignore(root):
+    """Keep the pins/scratchpad/to-do interfacile writes out of git, while still
+    tracking config.json. Idempotent — appends only if the rule isn't there."""
+    path = os.path.join(root, ".gitignore")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            existing = fh.read()
+    except FileNotFoundError:
+        existing = ""
+    if ".interfacile/*" in existing:
+        return False
+    lead = "" if (not existing or existing.endswith("\n")) else "\n"
+    if existing:
+        lead += "\n"
+    with open(path, "a", encoding="utf-8", newline="\n") as fh:
+        fh.write(lead + _GITIGNORE_BLOCK)
+    return True
+
+
 def _seed_tickets(root, prefix):
     """Create a minimal, valid starter tickets/ tree so a fresh repo has a
     populated board immediately: one epic charter + one open ticket."""
@@ -139,7 +166,7 @@ def cmd_init(args):
     root = os.path.abspath(args.path or os.getcwd())
     if not os.path.isdir(root):
         sys.exit("interfacile init: no such directory: " + root)
-    cfg = os.path.join(root, ".interfacile.json")
+    cfg = os.path.join(root, server.CONFIG_REL)
     existing = server.load_config(root)
     if existing:
         conf = existing
@@ -149,6 +176,9 @@ def cmd_init(args):
         _write(cfg, json.dumps(conf, indent=2, ensure_ascii=False) + "\n")
         print("• wrote %s  (prefix=%s, brand=%r, theme=blue)"
               % (cfg, conf["ids"]["prefix"], conf["brand"]["name"]))
+    if _ensure_gitignore(root):
+        print("• .gitignore: ignoring .interfacile/ state (pins, scratchpad, to-do), "
+              "keeping config.json")
     prefix = conf.get("ids", {}).get("prefix", "TK")
     if not os.path.isdir(os.path.join(root, "tickets")):
         _seed_tickets(root, prefix)
@@ -220,7 +250,7 @@ def main(argv=None):
                          "order). If omitted, serves every registered interface.")
     _add_serve_flags(hp)
 
-    ip = sub.add_parser("init", help="scaffold a repo's .interfacile.json and register it")
+    ip = sub.add_parser("init", help="scaffold a repo's .interfacile/config.json and register it")
     ip.add_argument("path", nargs="?", default=None, help="repo root (default: current dir)")
 
     rp = sub.add_parser("register", help="add a repo to the hub registry")

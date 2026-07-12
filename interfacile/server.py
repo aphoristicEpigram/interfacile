@@ -72,7 +72,7 @@ EPIC_EMOJI = {
 # --------------------------------------------------------------------------- #
 # Per-interface identity. These module-level names are the *live* values the
 # rest of the server reads; they start at the built-in defaults below and are
-# overwritten from a repo's interfacile.json at startup by apply_config().
+# overwritten from a repo's .interfacile/config.json at startup by apply_config().
 # --------------------------------------------------------------------------- #
 PFX = "EM"                       # ticket id prefix: <PFX>-1234, <PFX>-E001
 ID_DIGITS = 4                    # zero-padded ticket-number width
@@ -85,6 +85,7 @@ SERVER_PORT = 8787               # default listen port (config/--port override)
 THEME_REMAP = {}                 # canonical(blue)->theme hex map; {} == blue
 THEME_STRIP = None               # signature-strip colours, or None
 THEME_OVERRIDE_CSS = ""          # custom-palette :root override, or ""
+LINKS = []                       # per-project quick links: list of {emoji,title,url}
 
 # Frozen copies of the built-in defaults. apply_config() falls back to *these*
 # for any missing key, so switching interfaces resets cleanly instead of
@@ -319,50 +320,91 @@ def adr_index():
     return recs, by_num
 
 
-# Pinned tickets: id -> ISO timestamp of when it was pinned. Lives outside
-# tickets/ so pinning never dirties a ticket file (which would flag it WIP).
-PINS_FILE = os.path.join(REPO_ROOT, ".ticket-pins.json")
+# Per-repo runtime state (pins, scratchpad, to-do) lives in a single hidden
+# `.interfacile/` folder at the repo root instead of three loose dotfiles — same
+# files, same formats, just tucked out of the way. It's gitignored, so this state
+# never dirties a ticket file (which would flag it WIP) or lands in history. The
+# folder is created lazily on first write; reads fall back to the old flat
+# locations so existing pins/notes survive the move.
+STATE_DIR = ".interfacile"
+
+
+def _state_paths(root):
+    d = os.path.join(root, STATE_DIR)
+    return (os.path.join(d, "pins.json"),
+            {"scratch": os.path.join(d, "scratchpad.md"),
+             "todo": os.path.join(d, "todo.md")})
+
+
+def _legacy_state_paths(root):
+    return (os.path.join(root, ".ticket-pins.json"),
+            {"scratch": os.path.join(root, ".scratchpad.md"),
+             "todo": os.path.join(root, ".todo.md")})
+
+
+PINS_FILE, NOTE_FILES = _state_paths(REPO_ROOT)
+LEGACY_PINS_FILE, LEGACY_NOTE_FILES = _legacy_state_paths(REPO_ROOT)
+
+
+def _ensure_state_dir():
+    os.makedirs(os.path.dirname(PINS_FILE), exist_ok=True)
 
 
 def load_pins():
-    try:
-        with open(PINS_FILE, encoding="utf-8") as fh:
-            d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
+    for path in (PINS_FILE, LEGACY_PINS_FILE):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                d = json.load(fh)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            continue
+    return {}
 
 
 def save_pins(pins):
+    _ensure_state_dir()
     tmp = PINS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(pins, fh, indent=1, sort_keys=True)
     os.replace(tmp, PINS_FILE)
 
 
-# Scratch pad / to-do pop-outs: two free-form files at the repo root, outside
-# git (see .gitignore). No history, no schema — the dashboard just reads and
-# rewrites the whole file, so whatever was there greets you on the next run.
-NOTE_FILES = {
-    "scratch": os.path.join(REPO_ROOT, ".scratchpad.md"),
-    "todo": os.path.join(REPO_ROOT, ".todo.md"),
-}
-
-
+# Scratch pad / to-do pop-outs: two free-form files in `.interfacile/`. No
+# history, no schema — the dashboard just reads and rewrites the whole file, so
+# whatever was there greets you on the next run.
 def load_note(which):
-    try:
-        with open(NOTE_FILES[which], encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    except OSError:
-        return ""
+    for path in (NOTE_FILES[which], LEGACY_NOTE_FILES[which]):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            continue
+    return ""
 
 
 def save_note(which, content):
+    _ensure_state_dir()
     path = NOTE_FILES[which]
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(content)
     os.replace(tmp, path)
+
+
+def migrate_state(root):
+    """One-time tidy-up: move any legacy flat state files into `.interfacile/`.
+    Safe — these are the gitignored files the dashboard itself writes, and a move
+    only happens when the new slot is free, so newer state is never clobbered."""
+    new_pins, new_notes = _state_paths(root)
+    old_pins, old_notes = _legacy_state_paths(root)
+    pairs = [(old_pins, new_pins)] + [(old_notes[k], new_notes[k]) for k in old_notes]
+    for src, dst in pairs:
+        if os.path.exists(src) and not os.path.exists(dst):
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                os.replace(src, dst)
+            except OSError:
+                pass                 # best-effort; read-fallback still finds it
 
 
 def _working_tree_ids():
@@ -429,7 +471,8 @@ def scan():
                 "priority": priority if priority.isdigit() else "",
                 "effort": effort if effort_h is not None else "",
                 "effortH": effort_h, "epic": code, "wip": tid in wip_ids,
-                "pinned": tid in pins}
+                "pinned": tid in pins,
+                "slug": os.path.basename(path)[:-3]}   # id-title filename, for "copy ids"
         node_meta[tid] = {"id": tid, "title": title, "status": status,
                           "created": _iso(cdate), "closed": _iso(xdate)}
         node_meta[tid].update(meta)
@@ -911,6 +954,7 @@ padding:3px 9px;border-radius:5px;vertical-align:middle}
 .fm{background:var(--surface);border:1px solid var(--line);border-radius:9px;overflow:hidden;margin:0 0 28px}
 .fm .fm-h{font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;
 color:var(--mut);padding:11px 16px;border-bottom:1px solid var(--line);background:var(--surface2)}
+.fm .fm-h.fam-h{display:flex;align-items:center;gap:10px}
 .fm table{border-collapse:collapse;width:100%;font-size:.86rem}
 .fm td{padding:8px 16px;border-bottom:1px solid var(--line);vertical-align:top}
 .fm tr:last-child td{border-bottom:0}
@@ -1078,11 +1122,21 @@ def _family(tid, id_index):
     for osegs in sorted(kids_of.get(tid, []),
                         key=lambda s: tuple(_seg_key(x) for x in s)):
         kid = present[osegs]
+        kpath = id_index[kid]
         fm = {k: v for k, v in
-              frontmatter_scalars(split_frontmatter(read_text(id_index[kid]))[0])}
-        kids.append((kid, fm.get("status", "").upper(),
-                     fm.get("title", "").strip().strip('"') or kid,
-                     len(kids_of.get(kid, []))))
+              frontmatter_scalars(split_frontmatter(read_text(kpath))[0])}
+        clean = lambda k: fm.get(k, "").strip().strip('"')
+        kids.append({
+            "id": kid,
+            "slug": os.path.basename(kpath)[:-3],
+            "status": fm.get("status", "").upper(),
+            "title": clean("title") or kid,
+            "epic": epic_code(fm.get("epic", ""), kpath),
+            "priority": clean("priority"),
+            "risk": clean("risk").upper(),
+            "effort": clean("effort"),
+            "n_sub": len(kids_of.get(kid, [])),
+        })
     return nearest(segs), kids
 
 
@@ -1091,16 +1145,17 @@ def _family_block(kids):
     if not kids:
         return ""
     rows = ""
-    for kid, status, title, n_sub in kids:
-        sub = (" <span class='subn'>%d sub</span>" % n_sub) if n_sub else ""
+    for k in kids:
+        sub = (" <span class='subn'>%d sub</span>" % k["n_sub"]) if k["n_sub"] else ""
         rows += (
-            "<tr><td class='k'><a href='/ticket/%s'>%s</a></td>"
+            "<tr><td class='k'><a href='/ticket/%s'%s>%s</a></td>"
             "<td class='v'><span class='badge %s'>%s</span> %s%s</td></tr>" % (
-                urllib.parse.quote(kid), html.escape(kid),
-                STATUS_BADGE.get(status, "b-wf"), html.escape(status or "?"),
-                html.escape(title), sub))
-    return ("<div class='fm fam'><div class='fm-h'>sub-tickets (%d)</div>"
-            "<table><tbody>%s</tbody></table></div>" % (len(kids), rows))
+                urllib.parse.quote(k["id"]), _a_data(k), html.escape(k["id"]),
+                STATUS_BADGE.get(k["status"], "b-wf"), html.escape(k["status"] or "?"),
+                html.escape(k["title"]), sub))
+    return ("<div class='fm fam'><div class='fm-h fam-h'>sub-tickets (%d)%s</div>"
+            "<table id='famList'><tbody>%s</tbody></table></div>"
+            % (len(kids), _list_tools("#famList", "sub-tickets"), rows))
 
 
 def _dep_button(tid, dep_graph):
@@ -1178,7 +1233,10 @@ def render_ticket_page(path, known_ids=None, known_epics=None, adrs=None,
         + _dep_button(tid, dep_graph) +
         "<span class='editmsg' id='editMsg'></span>"
         "<button class='tb pin' id='pinBtn' type='button' data-pinned='"
-        + ("1" if pinned else "0") + "'>&#128278;</button></div>"
+        + ("1" if pinned else "0") + "'>&#128278;</button>"
+        "<button class='tb copy-one' type='button' data-copy='"
+        + html.escape(os.path.basename(path)[:-3], quote=True)
+        + "' title='Copy this ticket&#39;s id'>&#128203; Copy</button></div>"
         "<div id='view'>"
         "<div class='fm'><div class='fm-h'>frontmatter (yaml)</div>"
         "<table><tbody>" + rows + "</tbody></table></div>"
@@ -1291,6 +1349,10 @@ EPIC_CSS = TICKET_CSS + """
 .ehead{background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:22px 26px;margin-bottom:22px}
 .ehead .bar{height:14px;border-radius:5px;overflow:hidden;display:flex;background:var(--surface2);border:1px solid var(--line);margin:14px 0 10px}
 .ehead .bar span{height:100%}
+.ehead .tid{display:flex;align-items:center;gap:10px}
+.ecopy{font-family:var(--mono);font-size:.7rem;font-weight:500;color:var(--mut);background:var(--surface2);
+border:1px solid var(--line);border-radius:100px;padding:3px 10px;cursor:pointer}
+.ecopy:hover{border-color:var(--accent);color:var(--accent)}
 .sg-done{background:var(--done)}.sg-open{background:var(--accent)}.sg-wf{background:var(--wf)}
 .estats{display:flex;flex-wrap:wrap;gap:6px 26px;font-family:var(--mono);font-size:.78rem;color:var(--mut)}
 .estats b{color:var(--ink)}
@@ -1300,6 +1362,7 @@ EPIC_CSS = TICKET_CSS + """
 .col-h{font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;
 padding:10px 14px;border-bottom:1px solid var(--line);background:var(--surface2);display:flex;justify-content:space-between}
 .col-h .cnt{color:var(--ink)}
+.col-h .ch-r{display:flex;align-items:center;gap:12px}
 .col ul{list-style:none;margin:0;padding:6px}
 .col li a{display:flex;flex-wrap:wrap;gap:2px 10px;align-items:baseline;padding:7px 9px;border-radius:6px;text-decoration:none;color:inherit}
 .col li a:hover{background:var(--surface2)}
@@ -1533,10 +1596,10 @@ def _epic_ticket_li(t, is_child, datekey, today, show_epic=False):
         d = parse_date(date)
         if d:
             dlab = "%s · %dd old" % (date, (today - d).days)
-    return ('<li class="%s"%s><a href="/ticket/%s">'
+    return ('<li class="%s"%s><a href="/ticket/%s"%s>'
             '<span class="tk-id">%s</span><span class="tk-ttl">%s</span>'
             '<span class="tk-meta">%s%s</span></a></li>' % (
-                "child" if is_child else "", _li_attrs(t), html.escape(t["id"]),
+                "child" if is_child else "", _li_attrs(t), html.escape(t["id"]), _a_data(t),
                 html.escape(t["id"]), html.escape(t["title"]), chips,
                 ('<span class="tk-date">%s</span>' % html.escape(dlab)) if dlab else ""))
 
@@ -1557,6 +1620,16 @@ def _li_attrs(t):
                 "" if t.get("effortH") is None else ("%g" % t["effortH"]),
                 "y" if t.get("blocked") else "n",
                 html.escape((t["id"] + " " + t["title"]).lower())))
+
+
+def _a_data(t):
+    """data-* on the ticket <a> that the shared copy-ids / CSV toolbar reads."""
+    e = lambda v: html.escape("" if v is None else str(v), quote=True)
+    return (' data-slug="%s" data-title="%s" data-status="%s" data-epic="%s"'
+            ' data-priority="%s" data-risk="%s" data-effort="%s"' % (
+                e(t.get("slug") or t.get("id")), e(t.get("title")),
+                e(t.get("status")), e(t.get("epic")),
+                e(t.get("priority")), e(t.get("risk")), e(t.get("effort"))))
 
 
 def _ticket_card(t, is_child, datekey, today, show_epic=True):
@@ -1597,11 +1670,11 @@ def _ticket_card(t, is_child, datekey, today, show_epic=True):
     if is_child and m:
         sub = ('<span class="card-sub">&#8627; sub-ticket of %s</span>'
                % html.escape(m.group(1)))
-    return ('<li class="%s"%s><a href="/ticket/%s">'
+    return ('<li class="%s"%s><a href="/ticket/%s"%s>'
             '<span class="card-top"><span class="tk-id">%s</span>%s</span>'
             '<span class="card-ttl">%s</span>%s'
             '<span class="card-meta">%s</span></a></li>' % (
-                "child" if is_child else "", _li_attrs(t), html.escape(t["id"]),
+                "child" if is_child else "", _li_attrs(t), html.escape(t["id"]), _a_data(t),
                 html.escape(t["id"]),
                 ('<span class="tk-date">%s</span>' % html.escape(dlab)) if dlab else "",
                 html.escape(t["title"]), sub, chips))
@@ -1637,10 +1710,12 @@ def _status_col(kind, label, items, datekey, reverse, today, show_epic=False,
     else:
         lis = "".join(_epic_ticket_li(t, c, datekey, today, show_epic)
                       for t, c in _epic_group(items, datekey, reverse))
-    body = "<ul>" + lis + "</ul>" if lis else '<div class="empty">none</div>'
+    lid = "lst-" + kind
+    body = ('<ul id="%s">' % lid) + lis + "</ul>" if lis else '<div class="empty">none</div>'
+    tools = _list_tools("#" + lid, kind) if lis else ""
     return ('<div class="col col-%s%s"><div class="col-h"><span>%s</span>'
-            '<span class="cnt">%d</span></div>%s</div>'
-            % (kind, " cards" if cards else "", label, len(items), body))
+            '<span class="ch-r"><span class="cnt">%d</span>%s</span></div>%s</div>'
+            % (kind, " cards" if cards else "", label, len(items), tools, body))
 
 
 def render_epic_page(ep):
@@ -1666,13 +1741,21 @@ def render_epic_page(ep):
     stale_open = sum(1 for t in ep["openTickets"]
                      if t.get("created") and parse_date(t["created"])
                      and (today - parse_date(t["created"])).days > 30)
+    # ep["id"] already carries the E (e.g. "E007"), and the prefix is per-repo.
     charter = sorted(glob.glob(os.path.join(
-        TICKETS_DIR, "EM-%s-*" % ep["id"], "EM-%s-*.md" % ep["id"])))
+        TICKETS_DIR, "%s-%s-*" % (PFX, ep["id"]), "%s-%s-*.md" % (PFX, ep["id"]))))
     charter_link = ""
     if charter:
         charter_link = ('&nbsp;&middot;&nbsp; <a class="back" href="/doc/%s">'
                         'epic charter &rarr;</a>'
                         % html.escape(os.path.relpath(charter[0], REPO_ROOT)))
+    # The epic's on-disk id-slug (e.g. IF-E007-dashboard-ux), for the copy button.
+    edirs = sorted(glob.glob(os.path.join(TICKETS_DIR, "%s-%s-*" % (PFX, ep["id"]))))
+    epic_slug = (os.path.basename(edirs[0]) if edirs
+                 else "%s-%s" % (PFX, ep["id"]))
+    epic_copy = ("<button class='ecopy copy-one' type='button' data-copy='%s'"
+                 " title='Copy this epic&#39;s id'>&#128203; Copy</button>"
+                 % html.escape(epic_slug, quote=True))
     page = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -1682,7 +1765,7 @@ def render_epic_page(ep):
         "<style>" + EPIC_CSS + "</style></head><body><div class='wrap'>"
         "<a class='back' href='/'>&larr; back to dashboard</a>" + charter_link +
         "<div class='ehead'>"
-        "<div class='tid'>EM-" + html.escape(ep["id"]) + "</div>"
+        "<div class='tid'>EM-" + html.escape(ep["id"]) + epic_copy + "</div>"
         "<h1 class='title'><span class='e-emoji'>" + ep.get("emoji", "🎟️")
         + "</span>" + html.escape(ep["title"]) + "</h1>"
         "<div class='bar' role='img' aria-label='" + str(ep["closed"]) + " closed, "
@@ -2102,6 +2185,7 @@ a.ebar-row:hover .ebr-name{color:var(--accent-ink)}
 padding:10px 14px;border-bottom:1px solid var(--line-2);background:var(--surface-2)}
 .recent{padding:0 10px 6px}
 .recent .panel-h{margin:0 -10px 4px;border-radius:calc(var(--r) + 2px) calc(var(--r) + 2px) 0 0}
+.panel-h.ph-tools{display:flex;align-items:center;gap:10px}
 .upnext .b-meta.why{color:var(--accent-ink);border-color:var(--accent-ink)}
 .b-meta.blocked{color:var(--warn);border-color:var(--warn)}
 .b-meta.unblocks{color:var(--accent-ink);border-color:var(--accent-ink)}
@@ -2163,12 +2247,31 @@ justify-content:center;gap:2px;text-decoration:none;padding:8px 4px}
 .tag-row{display:flex;align-items:center;justify-content:space-between;gap:10px 14px;flex-wrap:wrap;margin-top:.7em}
 .tag-row .tagline{margin:0}
 .note-btns{display:inline-flex;gap:8px;flex:none}
-.notebtn{font-size:1rem;border:1px solid var(--line);border-radius:100px;
+.notebtn{position:relative;font-size:1rem;border:1px solid var(--line);border-radius:100px;
 width:38px;height:32px;cursor:pointer;line-height:1;padding:0;display:inline-flex;align-items:center;justify-content:center}
 .nb-notes{background:rgba(234,179,8,.16)}
 .nb-notes:hover,.nb-notes.active{border-color:#b45309;background:rgba(234,179,8,.32)}
 .nb-todo{background:rgba(220,38,38,.12)}
 .nb-todo:hover,.nb-todo.active{border-color:#c23b3b;background:rgba(220,38,38,.26)}
+/* per-project quick links — fully custom, unlimited, defined in the config */
+.proj-links{display:inline-flex;gap:8px;flex:none;align-items:center}
+.proj-links:empty{display:none}
+.proj-link{position:relative;font-size:1rem;text-decoration:none;border:1px solid var(--line);border-radius:100px;
+width:38px;height:32px;line-height:1;display:inline-flex;align-items:center;justify-content:center;background:var(--surface-2)}
+.proj-link:hover,.proj-link:focus-visible{border-color:var(--accent);background:var(--accent-soft)}
+.proj-link .pl-emo{display:inline-flex;pointer-events:none}
+/* title overlay on hover/focus so you know where a link goes */
+.pl-tip{position:absolute;top:calc(100% + 9px);left:50%;transform:translate(-50%,-4px);
+white-space:nowrap;font-family:var(--font-mono);font-size:.72rem;letter-spacing:.01em;color:var(--ink);
+background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:5px 10px;
+box-shadow:var(--shadow);opacity:0;pointer-events:none;transition:opacity .12s ease,transform .12s ease;z-index:400}
+.pl-tip::before{content:"";position:absolute;bottom:100%;left:50%;width:8px;height:8px;
+background:var(--surface);border-left:1px solid var(--line);border-top:1px solid var(--line);
+transform:translate(-50%,50%) rotate(45deg)}
+.proj-link:hover .pl-tip,.proj-link:focus-visible .pl-tip,
+.notebtn:hover .pl-tip,.notebtn:focus-visible .pl-tip{opacity:1;transform:translate(-50%,0)}
+/* standard mark shown after the dashboard title */
+.h-emo{font-size:.72em;vertical-align:.06em;margin-left:.06em}
 .notepanel{position:fixed;top:0;right:0;bottom:0;width:min(460px,92vw);z-index:500;display:flex;flex-direction:column;
 background:var(--surface);border-left:1px solid var(--line);box-shadow:-18px 0 44px rgba(0,0,0,.22)}
 .notepanel[hidden]{display:none}
@@ -2203,6 +2306,29 @@ color:var(--ink-mut);padding:12px 9px 4px;border-top:1px solid var(--line-2);mar
 .np-foot{flex:none;padding:9px 14px;border-top:1px solid var(--line-2)}
 .np-foot button{font-family:var(--font-mono);font-size:.68rem;color:var(--ink-mut);background:none;border:0;cursor:pointer;padding:0}
 .np-foot button:hover{color:var(--accent-ink)}
+.np-ico{font-size:.9rem;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-mut);
+border-radius:6px;width:28px;height:28px;cursor:pointer;line-height:1;padding:0;flex:none}
+.np-ico:hover{border-color:var(--accent);color:var(--accent-ink)}
+.np-ico.on{border-color:var(--accent);color:var(--accent-ink);background:var(--accent-soft)}
+.np-ico[hidden]{display:none}
+.np-prev{flex:1;overflow-y:auto;padding:14px 16px;font-size:.86rem;line-height:1.6;color:var(--ink)}
+.np-prev[hidden]{display:none}
+.np-prev>*:first-child{margin-top:0}
+.np-prev h1,.np-prev h2,.np-prev h3,.np-prev h4{margin:1.1em 0 .4em;line-height:1.25}
+.np-prev h1{font-size:1.14rem}.np-prev h2{font-size:1.02rem}.np-prev h3{font-size:.93rem}
+.np-prev p{margin:.6em 0}
+.np-prev ul,.np-prev ol{margin:.6em 0;padding-left:1.35em}
+.np-prev li{margin:.25em 0}
+.np-prev a{color:var(--accent-ink)}
+.np-prev code{font-family:var(--font-mono);font-size:.82em;background:var(--surface-2);
+border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+.np-prev pre{background:var(--surface-2);border:1px solid var(--line);border-radius:7px;padding:10px 12px;overflow-x:auto}
+.np-prev pre code{border:0;background:none;padding:0}
+.np-prev blockquote{margin:.6em 0;padding-left:12px;border-left:3px solid var(--line);color:var(--ink-mut)}
+.np-prev table{border-collapse:collapse;width:100%;font-size:.8rem;margin:.6em 0}
+.np-prev td,.np-prev th{border:1px solid var(--line);padding:5px 8px;text-align:left}
+.np-prev img{max-width:100%}
+.np-prev hr{border:0;border-top:1px solid var(--line);margin:1em 0}
 .ghbtn{display:inline-flex;align-items:center;gap:8px;font-family:var(--font-mono);font-size:.74rem;
 color:var(--ink);text-decoration:none;background:var(--surface-2);border:1px solid var(--line);
 border-radius:100px;padding:7px 14px;white-space:nowrap}
@@ -2271,16 +2397,17 @@ section.collapsed .sec-head{margin-bottom:0}
         <a id="ghBtn" class="ghbtn" hidden target="_blank" rel="noopener">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
           GitHub <span class="gh-sub" id="ghSub"></span></a>
+        <span class="proj-links" id="projLinks">__PROJECT_LINKS__</span>
+        <span class="note-btns">
+          <button class="notebtn nb-notes" type="button" data-which="scratch" aria-label="Open scratchpad"><span class="pl-emo">&#128221;</span><span class="pl-tip" role="tooltip">Scratchpad</span></button>
+          <button class="notebtn nb-todo" type="button" data-which="todo" aria-label="Open to-do list"><span class="pl-emo">&#128204;</span><span class="pl-tip" role="tooltip">To-do list</span></button>
+        </span>
         <button class="regen" id="regen" type="button"><span class="ic">&#8635;</span> Regenerate</button>
       </span>
     </div>
-    <h1>Clean Paste</h1>
+    <h1>Clean Paste <span class="h-emo" aria-hidden="true">__HDR_ICON__</span></h1>
     <div class="tag-row">
       <p class="tagline" id="tagline">Scanning tickets&hellip;</p>
-      <span class="note-btns">
-        <button class="notebtn nb-notes" type="button" data-which="scratch" title="Notes (.scratchpad.md)" aria-label="Open notes">&#128221;</button>
-        <button class="notebtn nb-todo" type="button" data-which="todo" title="To-do list (.todo.md)" aria-label="Open to-do list">&#128204;</button>
-      </span>
     </div>
     <div class="gsearch-row">
       <input id="gsearch" class="gsearch" type="search" autocomplete="off" spellcheck="false"
@@ -2316,25 +2443,7 @@ section.collapsed .sec-head{margin-bottom:0}
       </div>
     </div>
   </header>
-  <aside class="notepanel" id="notePanel" hidden aria-label="Notes pop-out">
-    <div class="np-head">
-      <span class="np-emo" id="npEmo">&#128221;</span>
-      <span class="np-title" id="npTitle">Notes</span>
-      <span class="np-file" id="npFile">.scratchpad.md</span>
-      <span class="np-status" id="npStatus"></span>
-      <button class="np-close" id="npClose" type="button" aria-label="Close notes">&times;</button>
-    </div>
-    <textarea id="npText" spellcheck="false"
-              placeholder="Jot it down &mdash; autosaves to a local file the server reads back next run. Not tracked in git."></textarea>
-    <div class="np-todo" id="npTodo" hidden>
-      <form class="np-add" id="npAdd">
-        <input id="npAddIn" type="text" autocomplete="off" spellcheck="false"
-               placeholder="Add a to-do &mdash; Enter to save">
-      </form>
-      <div class="np-items" id="npItems"></div>
-      <div class="np-foot"><button type="button" id="npDoneTgl" hidden></button></div>
-    </div>
-  </aside>
+  <!--NOTES_PANEL-->
   <nav class="qnav" aria-label="Jump to section">
     <a href="#sec-health"><b>01</b>Health</a>
     <a href="#sec-prioritize"><b>02</b>Prioritize</a>
@@ -2355,8 +2464,8 @@ section.collapsed .sec-head{margin-bottom:0}
     <div class="kpi clickable" data-href="/filter?status=open&quick=1&label=Ready%20quick%20wins" title="Open, unblocked, and estimated at four hours or less. Click for the list."><span class="k-val" id="k-quick">&mdash;</span><span class="k-lab">Ready quick wins</span><span class="k-sub" id="k-quick-sub">&nbsp;</span></div>
   </div>
   <div class="duo topstrip" id="topstrip">
-    <div class="recent" id="pinnedPanel"><div class="panel-h">&#128278; Pinned &middot; watching</div><div id="pinnedList"></div></div>
-    <div class="recent" id="wipPanel"><div class="panel-h">&#128295; Work in progress &middot; git working tree</div><div id="wipList"></div></div>
+    <div class="recent" id="pinnedPanel"><div class="panel-h ph-tools">&#128278; Pinned &middot; watching<span class='list-tools' data-src='#pinnedList' data-name='pinned'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="pinnedList"></div></div>
+    <div class="recent" id="wipPanel"><div class="panel-h ph-tools">&#128295; Work in progress &middot; git working tree<span class='list-tools' data-src='#wipList' data-name='wip'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="wipList"></div></div>
   </div>
   <section id="sec-health">
     <div class="sec-head"><h2><span class="h-num">01</span>Program health</h2>
@@ -2425,7 +2534,7 @@ section.collapsed .sec-head{margin-bottom:0}
       </figure>
     </div>
     <div class="recent upnext" style="margin-top:14px">
-      <div class="panel-h">Up next &mdash; unblocked, ranked by priority &middot; unblocks &middot; effort</div>
+      <div class="panel-h ph-tools">Up next &mdash; unblocked, ranked by priority &middot; unblocks &middot; effort<span class='list-tools' data-src='#upnextList' data-name='up-next'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span></div>
       <div id="upnextList"></div>
     </div>
   </section>
@@ -2439,8 +2548,8 @@ section.collapsed .sec-head{margin-bottom:0}
     </div>
     <p class="sec-note">The latest closes and the newest tickets, across every epic.</p>
     <div class="duo">
-      <div class="recent"><div class="panel-h">Recently closed</div><div id="recentList"></div></div>
-      <div class="recent"><div class="panel-h">Recently created &middot; still open</div><div id="createdList"></div></div>
+      <div class="recent"><div class="panel-h ph-tools">Recently closed<span class='list-tools' data-src='#recentList' data-name='recently-closed'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="recentList"></div></div>
+      <div class="recent"><div class="panel-h ph-tools">Recently created &middot; still open<span class='list-tools' data-src='#createdList' data-name='recently-created'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="createdList"></div></div>
     </div>
   </section>
   <section id="sec-backlog">
@@ -2501,6 +2610,7 @@ section.collapsed .sec-head{margin-bottom:0}
         </label>
         <button type="button" class="lnk" id="expandAll">expand all</button>
         <button type="button" class="lnk" id="collapseAll">collapse all</button>
+        <span class='list-tools' data-src='#backlog' data-name='backlog'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span>
       </div>
     </div>
     <p class="sec-note">Every epic with tickets. Toggle each card between <b>open</b> and <b>closed</b>; click a ticket to open its YAML + body. Open tickets list oldest first, closed list newest first. <span style="color:var(--warn)">DECISION</span> tickets are flagged; active working-tree work is highlighted.</p>
@@ -2640,7 +2750,7 @@ section.collapsed .sec-head{margin-bottom:0}
     var d=STATE.data,strip=document.getElementById("topstrip");
     var pins=d.pinned||[],wip=d.wip||[];
     function row(it,extra){
-      return '<a href="/ticket/'+encodeURIComponent(it.id)+'">'+
+      return '<a href="/ticket/'+encodeURIComponent(it.id)+'"'+dataAttrs(it)+'>'+
         statusChipHtml(it.status)+
         '<span class="b-tid">'+esc(it.id)+'</span>'+
         '<span class="b-ttl">'+esc(it.title)+'</span>'+
@@ -3088,6 +3198,13 @@ section.collapsed .sec-head{margin-bottom:0}
         '<span class="e-chip '+st.cls+'">'+st.txt+'</span></a>';
     }).join("")+'</div>';
   }
+  /* data-* the shared copy-ids / CSV toolbar reads off each ticket link */
+  function dataAttrs(it){
+    return ' data-slug="'+esc(it.slug||it.id)+'" data-title="'+esc(it.title||"")+'"'+
+      ' data-status="'+esc(it.status||"")+'" data-epic="'+esc(it.epic||"")+'"'+
+      ' data-priority="'+esc(it.priority||"")+'" data-risk="'+esc(it.risk||"")+'"'+
+      ' data-effort="'+esc(it.effort||"")+'"';
+  }
   function ticketRow(it,view,withEpic){
     var isDec=/DECISION|Decision:|CONCEPT/.test(it.title);
     var name=esc(it.title.replace(/^(DECISION\s*[—-]\s*|Decision:\s*|CONCEPT:\s*)/,""));
@@ -3096,13 +3213,13 @@ section.collapsed .sec-head{margin-bottom:0}
       view==="wf"?'<span class="b-dec">won\'t-fix</span>':
       view==="standing"?'<span class="b-dec">standing</span>':'';
     return '<li><a class="'+(view==="closed"?"closed":"")+'" href="/ticket/'+encodeURIComponent(it.id)+
-      '"><span class="b-tid">'+esc(it.id)+'</span>'+
+      '"'+dataAttrs(it)+'><span class="b-tid">'+esc(it.id)+'</span>'+
       '<span class="b-ttl">'+name+chip+'</span>'+
       '<span class="b-right">'+metaBadges(it,withEpic)+
       (date?'<span class="b-date">'+date+'</span>':'')+'</span></a></li>';
   }
   function recentRow(it,datefield,tidColor,extra){
-    return '<a href="/ticket/'+encodeURIComponent(it.id)+'">'+
+    return '<a href="/ticket/'+encodeURIComponent(it.id)+'"'+dataAttrs(it)+'>'+
       '<span class="b-tid"'+(tidColor?' style="color:'+tidColor+'"':'')+'>'+esc(it.id)+'</span>'+
       '<span class="b-ttl">'+esc(it.title)+'</span>'+
       '<span class="b-right">'+metaBadges(it,true)+extra+
@@ -3510,139 +3627,7 @@ section.collapsed .sec-head{margin-bottom:0}
   load();
 })();
 
-/* ---- notes / to-do pop-out (persisted to untracked files) ---- */
-(function(){
-  var panel=document.getElementById("notePanel"),ta=document.getElementById("npText"),
-      todoBox=document.getElementById("npTodo"),itemsEl=document.getElementById("npItems"),
-      addForm=document.getElementById("npAdd"),addIn=document.getElementById("npAddIn"),
-      doneTgl=document.getElementById("npDoneTgl"),
-      emo=document.getElementById("npEmo"),title=document.getElementById("npTitle"),
-      file=document.getElementById("npFile"),status=document.getElementById("npStatus"),
-      btns=document.querySelectorAll(".notebtn"),
-      META={scratch:{emo:"📝",title:"Notes",file:".scratchpad.md"},
-            todo:{emo:"📌",title:"To-do",file:".todo.md"}},
-      cur=null,loaded="",timer=null,items=[],showDone=false;
-  function setStatus(s){status.textContent=s;}
-  function markBtns(){
-    btns.forEach(function(b){b.classList.toggle("active",!panel.hidden&&b.dataset.which===cur);});
-  }
-  /* .todo.md is a real markdown task list: `- [ ] open` / `- [x] done`.
-     Any stray plain line is adopted as an open item and normalised on save. */
-  function parseTodo(s){
-    var out=[];
-    s.split("\n").forEach(function(ln){
-      var t=ln.trim();if(!t)return;
-      var m=t.match(/^[-*]\s*\[([ xX])\]\s*(.*)$/);
-      if(m)out.push({done:m[1].toLowerCase()==="x",text:m[2]});
-      else out.push({done:false,text:t.replace(/^[-*]\s+/,"")});
-    });
-    return out;
-  }
-  function serializeTodo(list){
-    return list.length?list.map(function(i){
-      return "- ["+(i.done?"x":" ")+"] "+i.text;}).join("\n")+"\n":"";
-  }
-  function content(){return cur==="todo"?serializeTodo(items):ta.value;}
-  function todoRow(it){
-    var d=document.createElement("div");d.className="np-it"+(it.done?" done":"");
-    var cb=document.createElement("input");cb.type="checkbox";cb.checked=it.done;
-    cb.addEventListener("change",function(){it.done=cb.checked;renderTodo();flush();});
-    var t=document.createElement("span");t.className="t";t.textContent=it.text;
-    var del=document.createElement("button");del.type="button";del.className="pin-x del";
-    del.textContent="✕";del.title="Delete";
-    del.addEventListener("click",function(){
-      items.splice(items.indexOf(it),1);renderTodo();flush();});
-    d.appendChild(cb);d.appendChild(t);d.appendChild(del);
-    return d;
-  }
-  function renderTodo(){
-    itemsEl.innerHTML="";
-    var open=items.filter(function(i){return !i.done;}),
-        done=items.filter(function(i){return i.done;});
-    if(!open.length){
-      var e=document.createElement("p");e.className="np-empty";
-      e.textContent=done.length?"All done. 🎉":"Nothing yet — add one above.";
-      itemsEl.appendChild(e);
-    }
-    open.forEach(function(it){itemsEl.appendChild(todoRow(it));});
-    if(done.length&&showDone){
-      var h=document.createElement("div");h.className="np-done-h";h.textContent="Done";
-      itemsEl.appendChild(h);
-      done.forEach(function(it){itemsEl.appendChild(todoRow(it));});
-    }
-    doneTgl.hidden=!done.length;
-    doneTgl.textContent=(showDone?"hide":"show")+" done ("+done.length+")";
-  }
-  function flush(sync){
-    if(timer){clearTimeout(timer);timer=null;}
-    if(cur===null||content()===loaded)return;
-    var body=JSON.stringify({which:cur,content:content()});
-    loaded=content();
-    if(sync&&navigator.sendBeacon){
-      navigator.sendBeacon("/api/note",new Blob([body],{type:"application/json"}));
-      return;
-    }
-    setStatus("saving…");
-    fetch("/api/note",{method:"POST",headers:{"Content-Type":"application/json"},body:body})
-      .then(function(r){return r.json();})
-      .then(function(j){setStatus(j.ok?"saved":"save failed");})
-      .catch(function(){setStatus("save failed — server down?");});
-  }
-  function close(){
-    flush();
-    panel.hidden=true;cur=null;
-    markBtns();
-  }
-  function open(which){
-    if(cur===which){close();return;}
-    flush();
-    cur=which;loaded="";
-    emo.textContent=META[which].emo;title.textContent=META[which].title;
-    file.textContent=META[which].file;
-    ta.hidden=which==="todo";todoBox.hidden=which!=="todo";
-    panel.hidden=false;markBtns();
-    ta.value="";ta.disabled=true;items=[];showDone=false;setStatus("loading…");
-    fetch("/api/note?which="+which)
-      .then(function(r){return r.json();})
-      .then(function(j){
-        if(cur!==which)return;           // switched away while loading
-        var c=j.ok?j.content:"";
-        loaded=c;setStatus(j.ok?"":"load failed");
-        if(which==="todo"){
-          items=parseTodo(c);renderTodo();
-          addIn.value="";addIn.focus();
-          if(serializeTodo(items)!==c)flush();  // normalise legacy flat text
-        }else{
-          ta.disabled=false;ta.value=c;ta.focus();
-        }
-      })
-      .catch(function(){
-        if(cur!==which)return;
-        ta.disabled=false;setStatus("load failed — server down?");});
-  }
-  btns.forEach(function(b){b.addEventListener("click",function(){open(b.dataset.which);});});
-  document.getElementById("npClose").addEventListener("click",close);
-  addForm.addEventListener("submit",function(e){
-    e.preventDefault();
-    var t=addIn.value.trim();if(!t)return;
-    items.push({done:false,text:t});addIn.value="";
-    renderTodo();flush();
-  });
-  doneTgl.addEventListener("click",function(){showDone=!showDone;renderTodo();});
-  ta.addEventListener("input",function(){
-    setStatus("…");
-    if(timer)clearTimeout(timer);
-    timer=setTimeout(function(){flush();},700);
-  });
-  ta.addEventListener("blur",function(){flush();});
-  ta.addEventListener("keydown",function(e){
-    if((e.metaKey||e.ctrlKey)&&e.key==="s"){e.preventDefault();flush();}
-  });
-  document.addEventListener("keydown",function(e){
-    if(e.key==="Escape"&&!panel.hidden)close();
-  });
-  window.addEventListener("beforeunload",function(){flush(true);});
-})();
+/*NOTES_JS*/
 </script></body></html>"""
 
 
@@ -4934,6 +4919,7 @@ PRIORITIZE_BODY = r"""
     <figcaption class="chart-cap">
       <span class="chart-title" id="tblTitle">Ranked backlog</span>
       <span class="legend2"><span class="lg2" id="sortLab"></span></span>
+      <button type="button" class="lnk" id="copyBtn" title="Copy the current view's ticket ids, one per line">copy ids</button>
       <button type="button" class="lnk" id="csvBtn">download CSV</button>
     </figcaption>
     <div id="tableHost"></div>
@@ -5140,6 +5126,21 @@ PRIORITIZE_SCRIPT = r"""
     a.click();URL.revokeObjectURL(url);
   }
 
+  function copyIds(list){
+    var text=list.map(function(t){return t.slug||t.id;}).join("\n");
+    var btn=document.getElementById("copyBtn"),done=function(ok){
+      btn.textContent=ok?"copied "+list.length:"copy failed";
+      setTimeout(function(){btn.textContent="copy ids";},1400);};
+    if(navigator.clipboard&&navigator.clipboard.writeText)
+      navigator.clipboard.writeText(text).then(function(){done(true);},function(){done(false);});
+    else{  // http/older-browser fallback
+      var ta=document.createElement("textarea");ta.value=text;
+      ta.style.position="fixed";ta.style.opacity="0";document.body.appendChild(ta);
+      ta.select();try{done(document.execCommand("copy"));}catch(e){done(false);}
+      document.body.removeChild(ta);
+    }
+  }
+
   function render(){
     var list=filtered(),ranked=sorted(list);
     renderTiles(list);
@@ -5182,6 +5183,8 @@ PRIORITIZE_SCRIPT = r"""
   });
   document.getElementById("csvBtn").addEventListener("click",function(){
     downloadCSV(sorted(filtered()));});
+  document.getElementById("copyBtn").addEventListener("click",function(){
+    copyIds(sorted(filtered()));});
 
   F.boot(function(d){
     STATE.data=d;
@@ -5452,6 +5455,65 @@ class Handler(BaseHTTPRequestHandler):
             self._send(json.dumps({"ok": True, "which": which}),
                        "application/json; charset=utf-8")
             return
+        if self.path == "/api/render":
+            # Render scratchpad markdown for the notes pop-out's preview toggle.
+            # md_to_html escapes raw HTML, so the result is safe to inject.
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                content = payload.get("content")
+                if not isinstance(content, str):
+                    raise ValueError("content must be a string")
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": "bad request: " + str(exc)}),
+                           "application/json; charset=utf-8", code=400)
+                return
+            try:
+                rendered = md_to_html(content)
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": str(exc)}),
+                           "application/json; charset=utf-8", code=500)
+                return
+            self._send(json.dumps({"ok": True, "html": rendered}),
+                       "application/json; charset=utf-8")
+            return
+        if self.path == "/api/links":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                action = payload.get("action")
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": "bad request: " + str(exc)}),
+                           "application/json; charset=utf-8", code=400)
+                return
+            links = _links_as_list()
+            try:
+                if action == "add":
+                    url = _normalize_url(payload.get("url"))
+                    if not url:
+                        raise ValueError("a url is required")
+                    entry = {}
+                    if (payload.get("emoji") or "").strip():
+                        entry["emoji"] = payload["emoji"].strip()
+                    if (payload.get("title") or "").strip():
+                        entry["title"] = payload["title"].strip()
+                    entry["url"] = url
+                    links.append(entry)
+                elif action == "remove":
+                    i = int(payload.get("index"))
+                    if not (0 <= i < len(links)):
+                        raise ValueError("index out of range")
+                    links.pop(i)
+                else:
+                    raise ValueError("unknown action")
+                save_links(links)
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": str(exc)}),
+                           "application/json; charset=utf-8", code=400)
+                return
+            self._send(json.dumps({"ok": True, "links": links}),
+                       "application/json; charset=utf-8")
+            return
         if self.path != "/api/save":
             self._send(json.dumps({"ok": False, "error": "not found"}),
                        "application/json; charset=utf-8", code=404)
@@ -5495,7 +5557,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # --------------------------------------------------------------------------- #
-# Config: read <repo>/interfacile.json and reskin the live server from it.
+# Config: read <repo>/.interfacile/config.json and reskin the live server from it.
 # --------------------------------------------------------------------------- #
 # A theme is a hex remap applied to the canonical (blue) template, plus an
 # optional signature strip. "blue" is the template's own colours (identity);
@@ -5635,11 +5697,228 @@ def resolve_theme(theme):
     return dict(t.get("remap", {})), t.get("strip"), ""
 
 
+def _normalize_url(url):
+    """Make a link actually clickable: a bare host like `acme.com` is a *relative*
+    href that goes nowhere, so give it an https:// scheme. Existing schemes,
+    mailto:/tel:, protocol-relative, and site-relative paths are left alone."""
+    url = (url or "").strip()
+    if url and "://" not in url and not url.startswith(("mailto:", "tel:", "/", "#", "?")):
+        url = "https://" + url
+    return url
+
+
+def render_project_links():
+    """Emoji link buttons from the config's `links` list, shown in the header
+    next to the pin/scratchpad. Every entry is fully user-defined —
+    `{"emoji", "title", "url"}` — with no fixed set and no limit, rendered in
+    order. A missing emoji falls back to 🔗; an entry with no url is skipped.
+    The title shows as a hover overlay. '' when there are none."""
+    items = LINKS
+    if isinstance(items, dict):        # tolerate an older {name: url|{...}} map
+        items = [v if isinstance(v, dict) else {"url": v, "title": k}
+                 for k, v in items.items()]
+    if not isinstance(items, list):
+        return ""
+    out = []
+    for it in items:
+        if isinstance(it, str):
+            url, emoji, title = it, "", ""
+        elif isinstance(it, dict):
+            url = it.get("url") or it.get("href") or ""
+            emoji = it.get("emoji") or ""
+            title = it.get("title") or it.get("label") or ""
+        else:
+            continue
+        url = _normalize_url(url)
+        if not url:
+            continue
+        emoji = emoji or "\U0001f517"   # 🔗 default when none is given
+        title = title or url
+        out.append(
+            "<a class=\"proj-link\" href=\"%s\" target=\"_blank\" rel=\"noopener\" "
+            "aria-label=\"%s\"><span class=\"pl-emo\">%s</span>"
+            "<span class=\"pl-tip\" role=\"tooltip\">%s</span></a>"
+            % (html.escape(url, quote=True), html.escape(title),
+               html.escape(emoji), html.escape(title)))
+    return "".join(out)
+
+
+def _links_as_list():
+    """Current links as a mutable list of dicts (tolerating the legacy map form)."""
+    items = LINKS
+    if isinstance(items, dict):
+        items = [v if isinstance(v, dict) else {"url": v, "title": k}
+                 for k, v in items.items()]
+    out = []
+    if isinstance(items, list):
+        for x in items:
+            if isinstance(x, dict):
+                out.append(dict(x))
+            elif isinstance(x, str):
+                out.append({"url": x})
+    return out
+
+
+def save_links(links):
+    """Write the links list into the active repo's `.interfacile/config.json`
+    (preserving every other key) and refresh the in-memory config, so an added or
+    removed link shows on the next page load without a restart."""
+    global LINKS
+    path = os.path.join(REPO_ROOT, CONFIG_REL)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            conf = json.load(fh)
+        if not isinstance(conf, dict):
+            conf = {}
+    except FileNotFoundError:
+        conf = {}
+    if links:
+        conf["links"] = links
+    else:
+        conf.pop("links", None)
+    _ensure_state_dir()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(conf, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, path)
+    LINKS = links
+    it = _IFACE_BY_SLUG.get(ACTIVE_SLUG)
+    if it is not None:
+        it.conf["links"] = links
+
+
+# The "+" pill that sits after the project links; the popover it opens is injected
+# once per page (see _linkedit_html / _transform_html).
+_LINK_ADD_BTN = ("<button class='link-add' type='button' "
+                 "title='Add or remove a header link' aria-label='Add link'>+</button>")
+
+
+def _linkedit_html():
+    """The add/remove-link popover: an add form plus the current links each with a
+    remove button. On success the page reloads so every link button refreshes."""
+    rows = []
+    for i, it in enumerate(_links_as_list()):
+        emoji = it.get("emoji") or "\U0001f517"
+        label = it.get("title") or it.get("url") or ""
+        rows.append("<div class='lk-row'><span class='lk-e'>%s</span>"
+                    "<span class='lk-t'>%s</span>"
+                    "<button type='button' class='lk-del' data-i='%d' title='Remove'>&times;</button></div>"
+                    % (html.escape(emoji), html.escape(label), i))
+    rows_html = "".join(rows) or "<div class='lk-empty'>No links yet.</div>"
+    css = ("<style>"
+        ".link-add{font-family:var(--font-mono);font-size:1.05rem;line-height:1;border:1px dashed var(--line);"
+        "background:var(--surface-2);color:var(--ink-mut);border-radius:100px;width:32px;height:32px;cursor:pointer;"
+        "display:inline-flex;align-items:center;justify-content:center;padding:0;flex:none}"
+        ".link-add:hover{border-style:solid;border-color:var(--accent);color:var(--accent-ink)}"
+        ".link-pop{position:fixed;top:58px;right:16px;z-index:650;width:min(300px,92vw);background:var(--surface);"
+        "border:1px solid var(--line);border-radius:12px;box-shadow:0 18px 44px rgba(0,0,0,.24);padding:12px}"
+        ".link-pop[hidden]{display:none}"
+        ".lk-h{font-family:var(--font-mono);font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;"
+        "color:var(--ink-mut);margin:0 0 9px}"
+        ".lk-add{display:grid;grid-template-columns:46px 1fr;gap:6px;margin-bottom:10px}"
+        ".lk-add input{font-family:var(--font-mono);font-size:.78rem;padding:6px 8px;border:1px solid var(--line);"
+        "border-radius:6px;background:var(--surface-2);color:var(--ink);outline:none;min-width:0}"
+        ".lk-add input:focus{border-color:var(--accent)}"
+        "#lkEmoji{text-align:center}#lkUrl{grid-column:1 / -1}"
+        ".lk-add button{grid-column:1 / -1;font-family:var(--font-mono);font-size:.76rem;background:var(--accent);"
+        "color:#fff;border:0;border-radius:6px;padding:7px;cursor:pointer}"
+        ".lk-list{display:flex;flex-direction:column;gap:2px;max-height:180px;overflow:auto}"
+        ".lk-row{display:flex;align-items:center;gap:8px;padding:5px 4px;border-radius:6px}"
+        ".lk-row:hover{background:var(--surface-2)}.lk-e{flex:none}"
+        ".lk-t{flex:1;font-size:.8rem;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+        ".lk-del{flex:none;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-mut);"
+        "border-radius:5px;width:22px;height:22px;cursor:pointer;line-height:1;padding:0}"
+        ".lk-del:hover{color:#c23b3b;border-color:#c23b3b}"
+        ".lk-empty{font-size:.8rem;color:var(--ink-mut);padding:6px 4px}"
+        ".lk-msg{font-family:var(--font-mono);font-size:.68rem;color:var(--ink-mut);margin-top:8px;min-height:1em}"
+        ".lk-msg.err{color:#c23b3b}"
+        "</style>")
+    body = ("<div class='link-pop' id='linkPop' hidden>"
+            "<p class='lk-h'>Header links</p>"
+            "<form class='lk-add' id='lkAdd'>"
+            "<input id='lkEmoji' maxlength='4' placeholder='&#128279;' aria-label='Emoji'>"
+            "<input id='lkTitle' placeholder='Title' aria-label='Title'>"
+            "<input id='lkUrl' type='text' inputmode='url' placeholder='example.com or https://&hellip;' "
+            "aria-label='URL' required>"
+            "<button type='submit'>Add link</button></form>"
+            "<div class='lk-list' id='lkList'>" + rows_html + "</div>"
+            "<div class='lk-msg' id='lkMsg'></div></div>")
+    js = ("<script>(function(){"
+          "var pop=document.getElementById('linkPop');if(!pop)return;"
+          "function show(o){pop.hidden=!o;}"
+          "document.addEventListener('click',function(e){"
+          "if(e.target.closest('.link-add')){e.preventDefault();e.stopPropagation();show(pop.hidden);return;}"
+          "if(!e.target.closest('#linkPop'))show(false);});"
+          "var msg=document.getElementById('lkMsg');"
+          "function fail(m){msg.className='lk-msg err';msg.textContent=m;}"
+          "function post(b){return fetch('/api/links',{method:'POST',"
+          "headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(function(r){return r.json();});}"
+          "document.getElementById('lkAdd').addEventListener('submit',function(e){e.preventDefault();"
+          "var url=document.getElementById('lkUrl').value.trim();if(!url){fail('a url is required');return;}"
+          "msg.className='lk-msg';msg.textContent='saving\\u2026';"
+          "post({action:'add',url:url,title:document.getElementById('lkTitle').value.trim(),"
+          "emoji:document.getElementById('lkEmoji').value.trim()})"
+          ".then(function(j){if(j.ok)location.reload();else fail(j.error||'failed');})"
+          ".catch(function(){fail('server down?');});});"
+          "document.getElementById('lkList').addEventListener('click',function(e){"
+          "var b=e.target.closest('.lk-del');if(!b)return;msg.className='lk-msg';msg.textContent='removing\\u2026';"
+          "post({action:'remove',index:parseInt(b.getAttribute('data-i'),10)})"
+          ".then(function(j){if(j.ok)location.reload();else fail(j.error||'failed');})"
+          ".catch(function(){fail('server down?');});});"
+          "})();</script>")
+    return css + body + js
+
+
+_LIST_TOOLS = r"""<style>
+.list-tools{display:inline-flex;gap:12px;align-items:center;margin-left:auto}
+.list-tools button{font-family:var(--font-mono,ui-monospace,monospace);font-size:.66rem;letter-spacing:.04em;
+color:var(--accent-ink,var(--accent,#0a7d6b));background:none;border:0;cursor:pointer;padding:0;white-space:nowrap}
+.list-tools button:hover{text-decoration:underline}
+</style><script>(function(){
+function rowsOf(sel){var c=sel&&document.querySelector(sel);if(!c)return [];
+  return Array.prototype.map.call(c.querySelectorAll('a[href*="/ticket/"]'),function(a){
+    var d=a.dataset||{},h=a.getAttribute("href")||"",id=decodeURIComponent((h.split("/ticket/")[1]||"").split(/[?#]/)[0]);
+    return {id:id,slug:d.slug||id,title:d.title||"",status:d.status||"",epic:d.epic||"",
+            priority:d.priority||"",risk:d.risk||"",effort:d.effort||""};});}
+function flash(btn,txt){var o=btn.getAttribute("data-lbl")||btn.textContent;btn.setAttribute("data-lbl",o);
+  btn.textContent=txt;setTimeout(function(){btn.textContent=o;},1400);}
+function copy(text,btn,msg){
+  var ok=function(){flash(btn,msg);},no=function(){flash(btn,"copy failed");};
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(text).then(ok,no);
+  else{var ta=document.createElement("textarea");ta.value=text;ta.style.position="fixed";ta.style.opacity="0";
+    document.body.appendChild(ta);ta.select();try{document.execCommand("copy")?ok():no();}catch(e){no();}document.body.removeChild(ta);}}
+function csv(items,name){
+  var head="id,title,status,epic,priority,risk,effort";
+  var body=items.map(function(t){return [t.id,'"'+String(t.title).replace(/"/g,'""')+'"',t.status,t.epic,t.priority,t.risk,t.effort].join(",");}).join("\n");
+  var url=URL.createObjectURL(new Blob([head+"\n"+body+"\n"],{type:"text/csv"}));
+  var a=document.createElement("a");a.href=url;a.download=name+"-"+new Date().toISOString().slice(0,10)+".csv";a.click();URL.revokeObjectURL(url);}
+document.addEventListener("click",function(e){
+  /* single-item copy (a ticket or epic page) */
+  var one=e.target.closest(".copy-one[data-copy]");
+  if(one){e.preventDefault();copy(one.getAttribute("data-copy"),one,"copied");return;}
+  var b=e.target.closest(".list-tools button");if(!b)return;
+  var box=b.closest(".list-tools"),items=rowsOf(box.getAttribute("data-src"));
+  if(!items.length){flash(b,"no items");return;}
+  if(b.classList.contains("lt-copy"))copy(items.map(function(t){return t.slug||t.id;}).join("\n"),b,"copied "+items.length);
+  else csv(items,box.getAttribute("data-name")||"tickets");
+});
+})();</script>"""
+
+
+def _list_tools(src, name):
+    """A tiny copy-ids + CSV toolbar bound (by CSS selector) to a ticket list."""
+    return ("<span class='list-tools' data-src='%s' data-name='%s'>"
+            "<button type='button' class='lt-copy'>copy ids</button>"
+            "<button type='button' class='lt-csv'>CSV</button></span>"
+            % (html.escape(src, quote=True), html.escape(name, quote=True)))
+
+
 def _transform_html(s):
     """Reskin one HTML page for the active interface: theme colours + signature
     strip, then brand, favicon, tagline, eyebrow, and id prefix. Each guard
     skips work when the value still equals the built-in (blue/Clean Paste)
-    default, so a repo with no interfacile.json pays nothing and looks unchanged."""
+    default, so a repo with no config pays nothing and looks unchanged."""
     if THEME_REMAP:
         for a, b in THEME_REMAP.items():
             s = s.replace(a, b)
@@ -5658,32 +5937,50 @@ def _transform_html(s):
         s = s.replace("The PII-firewall build tracked as", TAGLINE)
     if EYEBROW != "Ticket portfolio &middot; engineering program":
         s = s.replace("Ticket portfolio &middot; engineering program", EYEBROW)
+    # Dashboard-only tokens (no-ops on every other page). Always substituted so
+    # the standard title mark renders even with no config file.
+    if "__HDR_ICON__" in s:
+        s = s.replace("__HDR_ICON__", html.escape(HEADER_ICON))
+    if "__PROJECT_LINKS__" in s:
+        s = s.replace("__PROJECT_LINKS__", _LINK_ADD_BTN + render_project_links())
     if THEME_OVERRIDE_CSS:
         s = s.replace("</head>", "<style>" + THEME_OVERRIDE_CSS + "</style></head>", 1)
     s = s.replace("</body>", _FOOTER + "</body>", 1)
     if len(INTERFACES) > 1:
         is_dash = 'id="regen"' in s          # the dashboard has the Regenerate button
         s = _BODY_OPEN_RE.sub(lambda m: m.group(1) + _switcher_html(is_dash), s, count=1)
+        # Sub-pages get the notes/to-do drawer + logic injected so the bar's
+        # scratchpad/to-do buttons work there too (the dashboard has its own).
+        if not is_dash:
+            s = s.replace("</body>",
+                          _NOTES_PANEL_HTML + "<script>" + _NOTES_JS + "</script></body>", 1)
+    # Wherever the "+" add-link pill lands (dashboard head or the bar), give it its
+    # popover — the small emoji/title/url editor that writes config.json.
+    if "link-add" in s and "</body>" in s:
+        s = s.replace("</body>", _linkedit_html() + "</body>", 1)
+    # Wire copy-ids + CSV toolbars (ticket lists) and single-item copy buttons.
+    if ("list-tools" in s or "copy-one" in s) and "</body>" in s:
+        s = s.replace("</body>", _LIST_TOOLS + "</body>", 1)
     return s
 
 
+CONFIG_REL = os.path.join(STATE_DIR, "config.json")   # <repo>/.interfacile/config.json
+
+
 def load_config(repo_root):
-    """Read the repo's interface config, preferring the hidden `.interfacile.json`
-    and falling back to a visible `interfacile.json`. {} when neither exists; a
-    malformed file is warned about and ignored so a bad config never takes the
-    dashboard down."""
-    for name in (".interfacile.json", "interfacile.json"):
-        path = os.path.join(repo_root, name)
-        try:
-            with open(path, encoding="utf-8") as fh:
-                conf = json.load(fh)
-            return conf if isinstance(conf, dict) else {}
-        except FileNotFoundError:
-            continue
-        except Exception as exc:
-            sys.stderr.write("%s ignored (%s)\n" % (name, exc))
-            return {}
-    return {}
+    """Read the repo's interface config from `.interfacile/config.json`. {} when
+    it's absent; a malformed file is warned about and ignored so a bad config
+    never takes the dashboard down."""
+    path = os.path.join(repo_root, CONFIG_REL)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            conf = json.load(fh)
+        return conf if isinstance(conf, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        sys.stderr.write("%s ignored (%s)\n" % (CONFIG_REL, exc))
+        return {}
 
 
 def apply_config(conf):
@@ -5691,7 +5988,7 @@ def apply_config(conf):
     Missing keys keep the current (default) value, so partial configs are fine."""
     global PFX, ID_DIGITS, BRAND, FAVICON, HEADER_ICON, EYEBROW, TAGLINE
     global SERVER_PORT, EPIC_TITLES, EPIC_EMOJI, THEME_REMAP, THEME_STRIP, _IDRE
-    global THEME_OVERRIDE_CSS
+    global THEME_OVERRIDE_CSS, LINKS
     global TICKET_ID_RE, EPIC_CODE_RE, TICKET_PARTS_RE, DEP_ID_RE, SUB_ID_RE
     global TICKET_LINK_RE, EPIC_LINK_RE, _MD_EPIC_FILE_RE, _MD_TICKET_FILE_RE
 
@@ -5701,6 +5998,9 @@ def apply_config(conf):
     HEADER_ICON = brand.get("icon", brand.get("favicon", _DEF["icon"]))
     EYEBROW = brand.get("eyebrow", _DEF["eyebrow"])
     TAGLINE = brand.get("tagline", _DEF["tagline"])
+
+    links = conf.get("links", [])
+    LINKS = links if isinstance(links, (list, dict)) else []
 
     ids = conf.get("ids", {})
     PFX = ids.get("prefix", _DEF["pfx"])
@@ -5779,12 +6079,12 @@ def build_registry(repo_roots):
 def activate(iface):
     """Point every per-interface global at one interface for the current request."""
     global REPO_ROOT, TICKETS_DIR, ADR_DIR, PINS_FILE, NOTE_FILES, ACTIVE_SLUG
+    global LEGACY_PINS_FILE, LEGACY_NOTE_FILES
     REPO_ROOT = iface.root
     TICKETS_DIR = os.path.join(REPO_ROOT, "tickets")
     ADR_DIR = os.path.join(REPO_ROOT, "docs", "architecture", "adr")
-    PINS_FILE = os.path.join(REPO_ROOT, ".ticket-pins.json")
-    NOTE_FILES = {"scratch": os.path.join(REPO_ROOT, ".scratchpad.md"),
-                  "todo": os.path.join(REPO_ROOT, ".todo.md")}
+    PINS_FILE, NOTE_FILES = _state_paths(REPO_ROOT)
+    LEGACY_PINS_FILE, LEGACY_NOTE_FILES = _legacy_state_paths(REPO_ROOT)
     ACTIVE_SLUG = iface.slug
     apply_config(iface.conf)
 
@@ -5819,6 +6119,9 @@ body{padding-top:52px}
 padding:8px 18px;background:var(--surface,#fff);border-bottom:1px solid var(--line,#e2e2e2);
 box-shadow:0 1px 3px rgba(0,0,0,.06)}
 #ifc-actions{margin-left:auto;display:flex;align-items:center;gap:8px}
+/* GitHub info sits dead-centre in the bar, independent of the left/right slots */
+#ifc-center{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;align-items:center}
+#ifc-center:empty{display:none}
 #ifc-switch{position:relative}
 .ifc-i{margin-left:6px;font-size:1.02em}
 /* trigger */
@@ -5865,6 +6168,87 @@ background:var(--accent-soft,var(--surface-2,var(--surface2,#eef1ff)));
 border:1px solid var(--accent,#88a);border-radius:9px;padding:8px 13px;
 transition:background .12s,color .12s}
 #ifc-home:hover{background:var(--accent,#88a);color:var(--surface,#fff)}
+/* persistent controls carried onto every page: notes/to-do, github, links */
+#ifc-center,#ifc-actions{display:flex;align-items:center;gap:8px}
+#ifc-bar .note-btns{display:inline-flex;gap:8px}
+#ifc-bar .notebtn{position:relative;font-size:1rem;border:1px solid var(--line);border-radius:100px;
+width:38px;height:32px;cursor:pointer;line-height:1;padding:0;display:inline-flex;align-items:center;justify-content:center}
+#ifc-bar .nb-notes{background:rgba(234,179,8,.16)}
+#ifc-bar .nb-notes:hover,#ifc-bar .nb-notes.active{border-color:#b45309;background:rgba(234,179,8,.32)}
+#ifc-bar .nb-todo{background:rgba(220,38,38,.12)}
+#ifc-bar .nb-todo:hover,#ifc-bar .nb-todo.active{border-color:#c23b3b;background:rgba(220,38,38,.26)}
+#ifc-bar .proj-links{display:inline-flex;gap:8px;align-items:center}
+#ifc-bar .proj-links:empty{display:none}
+#ifc-bar .proj-link{position:relative;font-size:1rem;text-decoration:none;border:1px solid var(--line);border-radius:100px;
+width:38px;height:32px;line-height:1;display:inline-flex;align-items:center;justify-content:center;background:var(--surface-2)}
+#ifc-bar .proj-link:hover,#ifc-bar .proj-link:focus-visible{border-color:var(--accent);background:var(--accent-soft)}
+#ifc-bar .proj-link .pl-emo{display:inline-flex;pointer-events:none}
+#ifc-bar .pl-tip{position:absolute;top:calc(100% + 9px);left:50%;transform:translate(-50%,-4px);white-space:nowrap;
+font-family:var(--font-mono);font-size:.72rem;color:var(--ink);background:var(--surface);border:1px solid var(--line);
+border-radius:8px;padding:5px 10px;box-shadow:var(--shadow,0 8px 24px rgba(0,0,0,.2));opacity:0;pointer-events:none;transition:opacity .12s,transform .12s;z-index:400}
+#ifc-bar .proj-link:hover .pl-tip,#ifc-bar .proj-link:focus-visible .pl-tip,
+#ifc-bar .notebtn:hover .pl-tip,#ifc-bar .notebtn:focus-visible .pl-tip{opacity:1;transform:translate(-50%,0)}
+#ifc-bar .ghbtn{display:inline-flex;align-items:center;gap:7px;font-family:var(--font-mono);font-size:.72rem;color:var(--ink);
+text-decoration:none;background:var(--surface-2);border:1px solid var(--line);border-radius:100px;padding:6px 12px;white-space:nowrap}
+#ifc-bar .ghbtn:hover{border-color:var(--accent);background:var(--accent-soft);color:var(--accent-ink)}
+#ifc-bar .ghbtn svg{width:14px;height:14px;fill:currentColor;flex:none}
+/* the notes/to-do drawer, injected on non-dashboard pages */
+.notepanel{position:fixed;top:0;right:0;bottom:0;width:min(460px,92vw);z-index:600;display:flex;flex-direction:column;
+background:var(--surface);border-left:1px solid var(--line);box-shadow:-18px 0 44px rgba(0,0,0,.22)}
+.notepanel[hidden]{display:none}
+.np-head{display:flex;align-items:center;gap:9px;padding:12px 14px;border-bottom:1px solid var(--line);flex:none}
+.np-emo{flex:none}.np-title{font-weight:700;font-size:.9rem}
+.np-file{font-family:var(--font-mono);font-size:.66rem;color:var(--ink-mut);background:var(--surface-2);
+border:1px solid var(--line);border-radius:5px;padding:2px 7px;white-space:nowrap}
+.np-status{font-family:var(--font-mono);font-size:.66rem;color:var(--ink-mut);margin-left:auto;white-space:nowrap}
+.np-close{font-size:1.05rem;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-mut);
+border-radius:6px;width:28px;height:28px;cursor:pointer;line-height:1;padding:0;flex:none}
+.np-close:hover{color:#c23b3b;border-color:#c23b3b}
+.notepanel #npText{flex:1;width:100%;resize:none;border:0;outline:0;background:transparent;color:var(--ink);
+padding:14px 16px;font-family:var(--font-mono);font-size:.82rem;line-height:1.6}
+.np-todo{flex:1;display:flex;flex-direction:column;min-height:0}.np-todo[hidden]{display:none}
+.np-add{padding:12px 14px;border-bottom:1px solid var(--line);flex:none}
+.np-add input{width:100%;font-family:var(--font-mono);font-size:.8rem;padding:8px 11px;outline:none;
+border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color:var(--ink)}
+.np-add input:focus{border-color:var(--accent)}
+.np-items{flex:1;overflow-y:auto;padding:6px 8px}
+.np-it{display:flex;align-items:flex-start;gap:9px;padding:7px 9px;border-radius:7px}
+.np-it:hover{background:var(--surface-2)}
+.np-it input[type=checkbox]{margin-top:2px;accent-color:var(--accent);width:15px;height:15px;flex:none;cursor:pointer}
+.np-it .t{flex:1;font-size:.84rem;line-height:1.45;word-break:break-word}
+.np-it.done .t{color:var(--ink-mut);text-decoration:line-through}
+.np-it .del{opacity:0;font-family:var(--font-mono);font-size:.66rem;border:1px solid var(--line);
+background:var(--surface-2);border-radius:5px;cursor:pointer;color:var(--ink-mut);padding:1px 6px}
+.np-it:hover .del,.np-it .del:focus-visible{opacity:1}
+.np-empty{font-size:.82rem;color:var(--ink-mut);padding:10px 9px;margin:0}
+.np-done-h{font-family:var(--font-mono);font-size:.62rem;letter-spacing:.08em;text-transform:uppercase;
+color:var(--ink-mut);padding:12px 9px 4px;border-top:1px solid var(--line);margin-top:8px}
+.np-foot{flex:none;padding:9px 14px;border-top:1px solid var(--line)}
+.np-foot button{font-family:var(--font-mono);font-size:.68rem;color:var(--ink-mut);background:none;border:0;cursor:pointer;padding:0}
+.np-foot button:hover{color:var(--accent-ink)}
+.np-ico{font-size:.9rem;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-mut);
+border-radius:6px;width:28px;height:28px;cursor:pointer;line-height:1;padding:0;flex:none}
+.np-ico:hover{border-color:var(--accent);color:var(--accent-ink)}
+.np-ico.on{border-color:var(--accent);color:var(--accent-ink);background:var(--accent-soft)}
+.np-ico[hidden]{display:none}
+.np-prev{flex:1;overflow-y:auto;padding:14px 16px;font-size:.86rem;line-height:1.6;color:var(--ink)}
+.np-prev[hidden]{display:none}
+.np-prev>*:first-child{margin-top:0}
+.np-prev h1,.np-prev h2,.np-prev h3,.np-prev h4{margin:1.1em 0 .4em;line-height:1.25}
+.np-prev h1{font-size:1.14rem}.np-prev h2{font-size:1.02rem}.np-prev h3{font-size:.93rem}
+.np-prev p{margin:.6em 0}
+.np-prev ul,.np-prev ol{margin:.6em 0;padding-left:1.35em}
+.np-prev li{margin:.25em 0}
+.np-prev a{color:var(--accent-ink)}
+.np-prev code{font-family:var(--font-mono);font-size:.82em;background:var(--surface-2);
+border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+.np-prev pre{background:var(--surface-2);border:1px solid var(--line);border-radius:7px;padding:10px 12px;overflow-x:auto}
+.np-prev pre code{border:0;background:none;padding:0}
+.np-prev blockquote{margin:.6em 0;padding-left:12px;border-left:3px solid var(--line);color:var(--ink-mut)}
+.np-prev table{border-collapse:collapse;width:100%;font-size:.8rem;margin:.6em 0}
+.np-prev td,.np-prev th{border:1px solid var(--line);padding:5px 8px;text-align:left}
+.np-prev img{max-width:100%}
+.np-prev hr{border:0;border-top:1px solid var(--line);margin:1em 0}
 """
 
 _SWITCHER_JS = """
@@ -5891,24 +6275,213 @@ if(tn==='INPUT'||tn==='TEXTAREA'||tn==='SELECT'||(t&&t.isContentEditable))return
 var slug=keymap[(e.key||'').toLowerCase()];
 if(slug){e.preventDefault();go(slug);}
 });
-/* clicking outside the notes/todo pop-out closes it */
-document.addEventListener('mousedown',function(e){
-var np=document.getElementById('notePanel');
-if(np&&!np.hidden&&!np.contains(e.target)&&!(e.target.closest&&e.target.closest('.notebtn'))){
-var c=document.getElementById('npClose');if(c)c.click();}
-});
+/* click-outside-to-close now lives in the notes module itself, so it can honour
+   the "keep open" eye. */
 function relocate(){
+/* multi-interface: GitHub info goes to the centre of the sticky switcher bar;
+   project links + notes/to-do go to the right slot (links kept left of the
+   pin/scratchpad). Regenerate deliberately stays in the card header, top row,
+   across from the eyebrow — so it and the icons read as swapped. */
 var acts=document.getElementById('ifc-actions');
-if(acts){var gh=document.getElementById('ghBtn'),rg=document.getElementById('regen');
-if(gh)acts.appendChild(gh);if(rg)acts.appendChild(rg);}
-var head=document.querySelector('.head-btns'),notes=document.querySelector('.note-btns');
-if(head&&notes){while(notes.firstChild)head.appendChild(notes.firstChild);
-notes.parentNode.removeChild(notes);}
+if(!acts)return;
+var gh=document.getElementById('ghBtn');
+var links=document.getElementById('projLinks');
+var notes=document.querySelector('.note-btns');
+var mid=document.getElementById('ifc-center');
+if(gh&&mid)mid.appendChild(gh);
+if(links)acts.appendChild(links);
+if(notes)acts.appendChild(notes);
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',relocate);
 else relocate();
 })();
 """
+
+
+# The notes/to-do drawer + its logic, reused verbatim on every non-dashboard page
+# so the pin/scratchpad/to-do buttons "come with you". The dashboard keeps its own
+# inline copy; these are injected only on sub-pages (see _transform_html).
+_NOTES_PANEL_HTML = (
+    '<aside class="notepanel" id="notePanel" hidden aria-label="Notes pop-out">'
+    '<div class="np-head"><span class="np-emo" id="npEmo">&#128221;</span>'
+    '<span class="np-title" id="npTitle">Notes</span>'
+    '<span class="np-file" id="npFile">.interfacile/scratchpad.md</span>'
+    '<span class="np-status" id="npStatus"></span>'
+    '<button class="np-ico" id="npPrev" type="button" title="Preview markdown"'
+    ' aria-label="Preview markdown">&#128196;</button>'
+    '<button class="np-ico" id="npKeep" type="button" aria-pressed="false"'
+    ' title="Keep open while you navigate">&#128065;&#65039;</button>'
+    '<button class="np-close" id="npClose" type="button" aria-label="Close notes">&times;</button></div>'
+    '<textarea id="npText" spellcheck="false" placeholder="Jot it down &mdash; autosaves to a '
+    'local file the server reads back next run. Not tracked in git."></textarea>'
+    '<div class="np-prev" id="npPrevBox" hidden></div>'
+    '<div class="np-todo" id="npTodo" hidden><form class="np-add" id="npAdd">'
+    '<input id="npAddIn" type="text" autocomplete="off" spellcheck="false" '
+    'placeholder="Add a to-do &mdash; Enter to save"></form>'
+    '<div class="np-items" id="npItems"></div>'
+    '<div class="np-foot"><button type="button" id="npDoneTgl" hidden></button></div></div></aside>'
+)
+
+_NOTES_JS = r"""
+(function(){
+  var panel=document.getElementById("notePanel");if(!panel)return;
+  var ta=document.getElementById("npText"),
+      todoBox=document.getElementById("npTodo"),itemsEl=document.getElementById("npItems"),
+      addForm=document.getElementById("npAdd"),addIn=document.getElementById("npAddIn"),
+      doneTgl=document.getElementById("npDoneTgl"),
+      emo=document.getElementById("npEmo"),title=document.getElementById("npTitle"),
+      file=document.getElementById("npFile"),status=document.getElementById("npStatus"),
+      btns=document.querySelectorAll(".notebtn"),
+      prevBtn=document.getElementById("npPrev"),prevBox=document.getElementById("npPrevBox"),
+      keepBtn=document.getElementById("npKeep"),
+      META={scratch:{emo:"📝",title:"Notes",file:".interfacile/scratchpad.md"},
+            todo:{emo:"📌",title:"To-do",file:".interfacile/todo.md"}},
+      cur=null,loaded="",timer=null,items=[],showDone=false,preview=false;
+  var LS={get:function(k){try{return localStorage.getItem(k);}catch(e){return null;}},
+          set:function(k,v){try{localStorage.setItem(k,v);}catch(e){}}};
+  /* the eye: while on, clicking outside will NOT close the pop-out, and it
+     re-opens itself on the next page — so it follows you around the site. */
+  var keep=LS.get("ifcNotesKeep")==="1";
+  function setKeep(on){
+    keep=!!on;
+    keepBtn.classList.toggle("on",keep);
+    keepBtn.setAttribute("aria-pressed",keep?"true":"false");
+    keepBtn.title=keep?"Staying open as you navigate — click to release"
+                      :"Keep open while you navigate";
+    LS.set("ifcNotesKeep",keep?"1":"0");
+  }
+  /* markdown preview of the scratchpad, rendered by the server */
+  function setPrev(on){
+    preview=!!on&&cur==="scratch";
+    prevBtn.classList.toggle("on",preview);
+    ta.hidden=preview||cur==="todo";
+    prevBox.hidden=!preview;
+    if(!preview)return;
+    prevBox.innerHTML='<p class="np-empty">rendering…</p>';
+    fetch("/api/render",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({content:ta.value})})
+      .then(function(r){return r.json();})
+      .then(function(j){prevBox.innerHTML=(j.ok&&j.html)?j.html
+        :'<p class="np-empty">Nothing to preview.</p>';})
+      .catch(function(){prevBox.innerHTML='<p class="np-empty">preview failed</p>';});
+  }
+  function setStatus(s){status.textContent=s;}
+  function markBtns(){btns.forEach(function(b){b.classList.toggle("active",!panel.hidden&&b.dataset.which===cur);});}
+  function parseTodo(s){
+    var out=[];
+    s.split("\n").forEach(function(ln){
+      var t=ln.trim();if(!t)return;
+      var m=t.match(/^[-*]\s*\[([ xX])\]\s*(.*)$/);
+      if(m)out.push({done:m[1].toLowerCase()==="x",text:m[2]});
+      else out.push({done:false,text:t.replace(/^[-*]\s+/,"")});
+    });
+    return out;
+  }
+  function serializeTodo(list){
+    return list.length?list.map(function(i){return "- ["+(i.done?"x":" ")+"] "+i.text;}).join("\n")+"\n":"";
+  }
+  function content(){return cur==="todo"?serializeTodo(items):ta.value;}
+  function todoRow(it){
+    var d=document.createElement("div");d.className="np-it"+(it.done?" done":"");
+    var cb=document.createElement("input");cb.type="checkbox";cb.checked=it.done;
+    cb.addEventListener("change",function(){it.done=cb.checked;renderTodo();flush();});
+    var t=document.createElement("span");t.className="t";t.textContent=it.text;
+    var del=document.createElement("button");del.type="button";del.className="pin-x del";
+    del.textContent="✕";del.title="Delete";
+    del.addEventListener("click",function(){items.splice(items.indexOf(it),1);renderTodo();flush();});
+    d.appendChild(cb);d.appendChild(t);d.appendChild(del);return d;
+  }
+  function renderTodo(){
+    itemsEl.innerHTML="";
+    var open=items.filter(function(i){return !i.done;}),done=items.filter(function(i){return i.done;});
+    if(!open.length){var e=document.createElement("p");e.className="np-empty";
+      e.textContent=done.length?"All done. 🎉":"Nothing yet — add one above.";itemsEl.appendChild(e);}
+    open.forEach(function(it){itemsEl.appendChild(todoRow(it));});
+    if(done.length&&showDone){var h=document.createElement("div");h.className="np-done-h";h.textContent="Done";
+      itemsEl.appendChild(h);done.forEach(function(it){itemsEl.appendChild(todoRow(it));});}
+    doneTgl.hidden=!done.length;doneTgl.textContent=(showDone?"hide":"show")+" done ("+done.length+")";
+  }
+  function flush(sync){
+    if(timer){clearTimeout(timer);timer=null;}
+    if(cur===null||content()===loaded)return;
+    var body=JSON.stringify({which:cur,content:content()});loaded=content();
+    if(sync&&navigator.sendBeacon){navigator.sendBeacon("/api/note",new Blob([body],{type:"application/json"}));return;}
+    setStatus("saving…");
+    fetch("/api/note",{method:"POST",headers:{"Content-Type":"application/json"},body:body})
+      .then(function(r){return r.json();}).then(function(j){setStatus(j.ok?"saved":"save failed");})
+      .catch(function(){setStatus("save failed — server down?");});
+  }
+  function close(){flush();panel.hidden=true;cur=null;setPrev(false);markBtns();LS.set("ifcNotesOpen","");}
+  function open(which){
+    if(cur===which){close();return;}
+    flush();cur=which;loaded="";preview=false;
+    emo.textContent=META[which].emo;title.textContent=META[which].title;file.textContent=META[which].file;
+    todoBox.hidden=which!=="todo";panel.hidden=false;
+    prevBtn.hidden=which!=="scratch";setPrev(false);markBtns();
+    LS.set("ifcNotesOpen",which);
+    ta.value="";ta.disabled=true;items=[];showDone=false;setStatus("loading…");
+    fetch("/api/note?which="+which).then(function(r){return r.json();}).then(function(j){
+      if(cur!==which)return;
+      var c=j.ok?j.content:"";loaded=c;setStatus(j.ok?"":"load failed");
+      if(which==="todo"){items=parseTodo(c);renderTodo();addIn.value="";addIn.focus();
+        if(serializeTodo(items)!==c)flush();}
+      else{ta.disabled=false;ta.value=c;ta.focus();}
+    }).catch(function(){if(cur!==which)return;ta.disabled=false;setStatus("load failed — server down?");});
+  }
+  btns.forEach(function(b){b.addEventListener("click",function(){open(b.dataset.which);});});
+  document.getElementById("npClose").addEventListener("click",close);
+  addForm.addEventListener("submit",function(e){e.preventDefault();var t=addIn.value.trim();if(!t)return;
+    items.push({done:false,text:t});addIn.value="";renderTodo();flush();});
+  doneTgl.addEventListener("click",function(){showDone=!showDone;renderTodo();});
+  ta.addEventListener("input",function(){setStatus("…");if(timer)clearTimeout(timer);
+    timer=setTimeout(function(){flush();},700);});
+  ta.addEventListener("blur",function(){flush();});
+  ta.addEventListener("keydown",function(e){if((e.metaKey||e.ctrlKey)&&e.key==="s"){e.preventDefault();flush();}});
+  document.addEventListener("keydown",function(e){if(e.key==="Escape"&&!panel.hidden)close();});
+  window.addEventListener("beforeunload",function(){flush(true);});
+  keepBtn.addEventListener("click",function(){setKeep(!keep);});
+  prevBtn.addEventListener("click",function(){flush();setPrev(!preview);});
+  /* click-outside closes the pop-out — unless the eye is on */
+  document.addEventListener("mousedown",function(e){
+    if(panel.hidden||keep)return;
+    if(panel.contains(e.target))return;
+    if(e.target.closest&&e.target.closest(".notebtn"))return;
+    close();
+  });
+  setKeep(keep);
+  var was=LS.get("ifcNotesOpen");
+  if(keep&&(was==="scratch"||was==="todo"))open(was);   /* follow me across pages */
+})();
+"""
+
+# One source of truth: the dashboard embeds the same panel + logic the sub-pages
+# get injected, so the notes pop-out can never drift between them.
+DASHBOARD_HTML = DASHBOARD_HTML.replace("<!--NOTES_PANEL-->", _NOTES_PANEL_HTML, 1)
+DASHBOARD_HTML = DASHBOARD_HTML.replace("/*NOTES_JS*/", _NOTES_JS, 1)
+
+
+def _gh_link_html():
+    """A GitHub link for the sticky bar, from this repo's origin remote. '' if none."""
+    g = _git_info() or {}
+    url = g.get("url")
+    if not url:
+        return ""
+    return ("<a class='ghbtn' href='%s' target='_blank' rel='noopener' title='Open the repository'>"
+            "<svg viewBox='0 0 16 16' aria-hidden='true'><path d='%s'/></svg>GitHub</a>"
+            % (html.escape(url, quote=True), _GH_PATH))
+
+
+def _persist_controls_html():
+    """(centre, right) markup for the bar on non-dashboard pages: GitHub centred,
+    then project links + the notes/to-do buttons on the right — so they follow you."""
+    notes = ("<span class='note-btns'>"
+             "<button class='notebtn nb-notes' type='button' data-which='scratch' aria-label='Open scratchpad'>"
+             "<span class='pl-emo'>&#128221;</span><span class='pl-tip' role='tooltip'>Scratchpad</span></button>"
+             "<button class='notebtn nb-todo' type='button' data-which='todo' aria-label='Open to-do list'>"
+             "<span class='pl-emo'>&#128204;</span><span class='pl-tip' role='tooltip'>To-do list</span></button>"
+             "</span>")
+    links = "<span class='proj-links'>" + _LINK_ADD_BTN + render_project_links() + "</span>"
+    return _gh_link_html(), links + notes
 
 
 def _switcher_html(is_dash=True):
@@ -5943,6 +6516,11 @@ def _switcher_html(is_dash=True):
                " data-key='%s'" % html.escape(it.shortcut) if it.shortcut else "",
                " aria-selected='true'" if it.slug == ACTIVE_SLUG else "",
                _name(it), _sub(it), kbd))
+    # On the dashboard these stay empty (its own controls relocate here via JS);
+    # on every other page we render github + links + notes so they follow you.
+    center, actions = ("", "")
+    if not is_dash:
+        center, actions = _persist_controls_html()
     return (
         "<div id='ifc-bar'><div id='ifc-switch'>"
         "<button id='ifc-cur' type='button' aria-haspopup='listbox' aria-expanded='false'>"
@@ -5951,7 +6529,9 @@ def _switcher_html(is_dash=True):
         "<ul id='ifc-menu' role='listbox'>"
         "<li class='ifc-hd' aria-hidden='true' style='cursor:default'>Switch interface</li>"
         + "".join(rows) + "</ul>"
-        "</div>" + home + "<div id='ifc-actions'></div></div>"
+        "</div>" + home
+        + "<div id='ifc-center'>" + center + "</div>"
+        + "<div id='ifc-actions'>" + actions + "</div></div>"
         "<style>" + _SWITCHER_CSS + "</style><script>" + _SWITCHER_JS + "</script>"
     )
 
@@ -5966,6 +6546,7 @@ def run(repo_roots, port=None, host="127.0.0.1", open_browser=True):
     for it in INTERFACES:
         if not os.path.isdir(os.path.join(it.root, "tickets")):
             sys.exit("tickets/ not found at %s" % os.path.join(it.root, "tickets"))
+        migrate_state(it.root)       # fold any legacy flat state into .interfacile/
 
     activate(INTERFACES[0])       # startup default; each request re-activates
 
@@ -6005,7 +6586,7 @@ def main(argv=None):
     """Backward-compatible flat CLI, used by the scripts/dev shim."""
     ap = argparse.ArgumentParser(description="interfacile — ticket-portfolio dashboard.")
     ap.add_argument("--port", type=int, default=None,
-                    help="listen port (overrides .interfacile.json; default 8787)")
+                    help="listen port (overrides .interfacile/config.json; default 8787)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--no-open", action="store_true", help="do not auto-open a browser")
     ap.add_argument("--repo", action="append", default=None, metavar="PATH",
