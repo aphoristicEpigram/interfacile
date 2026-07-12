@@ -1,0 +1,37 @@
+{
+  "brand": {
+    "name": "Nightshade",
+    "favicon": "🌙",
+    "icon": "🌙",
+    "eyebrow": "Ticket portfolio · side project",
+    "tagline": "The rewrite is tracked as"
+  },
+  "ids": {
+    "prefix": "NS",
+    "digits": 4
+  },
+  "epics": {
+    "E001": { "title": "Core Engine",  "emoji": "⚙️" },
+    "E002": { "title": "Launch Prep",  "emoji": "🚀" }
+  },
+  "links": [
+    { "emoji": "⚙️", "title": "Backend", "url": "https://github.com/acme/api" },
+    { "emoji": "🚀", "title": "Live app", "url": "https://app.acme.com" }
+  ],
+  "theme": {
+    "name": "nightshade",
+    "strip": ["#8ff0fb", "#a78bfa", "#f472b6"],
+    "light": {
+      "ground": "#ece7f2", "surface": "#ffffff", "ink": "#14101f",
+      "muted": "#675d77", "line": "#dcd5e6", "accent": "#06718a",
+      "done": "#2b9e33", "warn": "#bd5410", "wontfix": "#948aa0"
+    },
+    "dark": {
+      "ground": "#100b1a", "surface": "#1a1428", "ink": "#ece8f3",
+      "muted": "#948ba6", "line": "#322640", "accent": "#8ff0fb",
+      "done": "#46d332", "warn": "#ff8a4d", "wontfix": "#71697f"
+    }
+  },
+  "shortcut": "2",
+  "server": { "port": 8788 }
+}

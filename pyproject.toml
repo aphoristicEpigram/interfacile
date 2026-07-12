@@ -27,3 +27,6 @@ Issues = "https://github.com/aphoristicEpigram/interfacile/issues"
 
 [tool.setuptools]
 packages = ["interfacile"]
+
+[tool.setuptools.package-data]
+interfacile = ["templates/**/*.md"]

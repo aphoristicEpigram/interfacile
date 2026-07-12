@@ -24,26 +24,28 @@ interfacile                           # from the repo root: interfacile's own bo
 interfacile hub --repo examples --repo .   # both, with the switcher
 ```
 
-Run the tests:
+Run the tests (standard library only, like everything else):
 
 ```bash
-pytest tests/tooling/
+python -m unittest discover tests
 ```
 
 ## How work is tracked
 
 interfacile tracks its own development **in interfacile** — see [`tickets/`](tickets/)
-(or just run `interfacile` in the repo). Open work lives there; feel free to pick
-something up or propose a new ticket in your PR.
+(or just run `interfacile` in the repo). The flow is the built-in one:
+`interfacile new "Title" --epic E00N` to file work, `interfacile close ID` when
+it ships, `interfacile lint` to keep the tree honest. Feel free to pick
+something up from `interfacile ready`, or propose a new ticket in your PR.
 
 ## Proposing a change
 
 1. Open an issue first for anything non-trivial, so we can agree on the approach.
 2. Branch off `main`, keep changes focused, and match the surrounding code style.
-3. **No new runtime dependencies.** The dashboard engine is stdlib-only; the
-   hygiene tooling uses `PyYAML` and nothing else.
-4. If you touch the server, verify it still boots and renders:
-   `python3 -m interfacile serve --repo examples --no-open` and click around.
+3. **No new dependencies** — runtime or test. Everything is stdlib.
+4. Run `python -m unittest discover tests`, and if you touch the server, verify
+   it still boots and renders: `interfacile serve --repo examples --no-open`
+   and click around.
 5. Open a PR describing what changed and why. Screenshots help for UI changes.
 
 ## Good first contributions

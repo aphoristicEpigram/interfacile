@@ -1,41 +1,40 @@
-# Example scaffold
+# Examples
 
-A minimal, valid `tickets/` tree you can copy as a starting point. It exists so the
-dashboard and hygiene tools have something to render on a fresh repo, and so the
-frontmatter schema is demonstrated by example.
+A self-contained demo board plus ready-made config files.
 
 ```
 examples/
-  tickets/
-    EM-E001-example-epic/
-      EM-E001-example-epic.md      # epic charter (index_exempt: true)
-      open/
-        EM-0001-example-open-ticket.md
-      closed/
-        EM-0002-example-closed-ticket.md   # includes the closure retro section
-  engineering-reference.md         # epic-table markers for update_agents_epic_table.py
+  .interfacile/config.json      # the demo's own interface config
+  tickets/                      # a small, valid EX- ticket tree
+    EX-E001-core/
+      EX-E001-core.md           # epic charter
+      open/  closed/
+    EX-E002-interface/
+      ...
+  configs/                      # example .interfacile/config.json files
+    starter.interfacile.json        # the minimal useful config
+    custom-theme.interfacile.json   # full custom palette, links, epics
 ```
 
-## Try it
+## Try the demo board
 
-From this kit's root:
+From the repo root (no setup, nothing written outside `examples/`):
 
 ```bash
-# Point the tools at this example tree and open the dashboard
-TICKET_DASHBOARD_REPO="$(pwd)/examples" python scripts/dev/ticket_report_server.py
-#   ...or:  python scripts/dev/ticket_report_server.py --repo "$(pwd)/examples"
-
-# Run the hygiene lint against the example tree
-TICKET_DASHBOARD_REPO="$(pwd)/examples" python scripts/ticket_hygiene/ticket.py lint
-
-# Generate the index the dashboard/tools expect
-TICKET_DASHBOARD_REPO="$(pwd)/examples" \
-  python scripts/ticket_hygiene/generate_index.py > examples/tickets/TICKET_INDEX.md
+interfacile serve --repo examples
 ```
 
-## Use as a starting point for a real project
+The ticket flow works against it too:
 
-1. Copy `examples/tickets/` to `tickets/` at your project root.
-2. Rename the epic dir/id and ticket ids to your scheme.
-3. Generate `tickets/TICKET_INDEX.md` (command above, without the `examples` override).
-4. Follow `docs/tickets/EM-1148-ticket-creation-standard.md` for the full schema.
+```bash
+interfacile tickets --repo examples
+interfacile lint    --repo examples
+```
+
+## Start a real project
+
+Don't copy this tree — run `interfacile init` in your repo instead. It infers
+your id prefix, offers an epic wizard, seeds a starter `tickets/` tree, and
+installs the ticket-flow skills. The files here are for reading: the `EX-`
+tickets show the frontmatter schema in practice, and
+[`configs/`](configs/) documents every config field.

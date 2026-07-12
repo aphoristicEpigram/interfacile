@@ -6,22 +6,33 @@
                                       (no --repo => every registered interface)
 
     interfacile init   [PATH]         scaffold a repo's .interfacile/config.json + register it
+                                      (offers a wizard to create your first epics)
+    interfacile epics  [PATH]         create more epics interactively (folder + charter)
+    interfacile skills [PATH]         install/refresh the ticket-flow skills + process doc
+    interfacile shortcut [KEY]        show/set/clear this repo's hub switcher key
     interfacile register   [PATH]     add a repo to the hub registry
     interfacile unregister [PATH]     remove a repo from the registry
     interfacile list                  list registered interfaces
+
+The ticket flow (see `interfacile <cmd> -h`):
+    new · tickets · ready · show · deps · close · lint
 
 Common serve flags: --port N  --host H  --no-open
 """
 import argparse
 import datetime
-import glob
 import json
 import os
 import re
 import sys
 
 from . import __version__
+from . import scaffold
 from . import server
+from . import ticket
+from .ticket import fallback_prefix as _fallback_prefix
+from .ticket import infer_prefix as _infer_prefix
+from .ticket import slugify as _slugify
 
 
 # --------------------------------------------------------------------------- #
@@ -82,24 +93,20 @@ def _unregister(root):
 # --------------------------------------------------------------------------- #
 # init — scaffold a repo's config and register it
 # --------------------------------------------------------------------------- #
-def _infer_prefix(root):
-    """Guess the ticket id prefix from existing ticket filenames (TH-0004 -> TH)."""
-    for f in glob.glob(os.path.join(root, "tickets", "**", "*.md"), recursive=True):
-        m = re.match(r"([A-Za-z]{1,6})-E?\d{2,}", os.path.basename(f))
-        if m:
-            return m.group(1).upper()
-    return None
-
-
-def _default_config(root):
+def _default_config(root, prefix=None):
     name = os.path.basename(root.rstrip("/")).replace("-", " ").replace("_", " ").title()
-    prefix = _infer_prefix(root) or (re.sub(r"[^A-Za-z]", "", name)[:2].upper() or "TK")
+    prefix = prefix or _infer_prefix(root) or _fallback_prefix(root)
+    # Name the epics this repo actually has. Leaving this empty makes the engine
+    # fall back to *its* defaults, which is how one project's epic names would
+    # end up on another project's board.
+    epics = {code: {"title": title, "emoji": "🎟️"} for code, title
+             in server.discover_epic_meta(os.path.join(root, "tickets"), prefix).items()}
     return {
         "brand": {"name": name, "favicon": "🎟️", "icon": "🎟️",
                   "eyebrow": "Ticket portfolio · engineering program",
                   "tagline": "This project is tracked as"},
         "ids": {"prefix": prefix, "digits": 4},
-        "epics": {},
+        "epics": epics,
         "theme": "blue",
         "server": {"port": 8787},
     }
@@ -162,30 +169,206 @@ def _seed_tickets(root, prefix):
     return epic_dir
 
 
+# --------------------------------------------------------------------------- #
+# Epic wizard — create bare-bones epics (folder + charter) interactively.
+# --------------------------------------------------------------------------- #
+def _next_code(taken):
+    n = 1
+    while ("E%03d" % n) in taken:
+        n += 1
+    return "E%03d" % n
+
+
+def _create_epic(root, prefix, code, title, emoji):
+    """A bare-bones epic: the folder, its open/ + closed/ bays, and a charter
+    whose front-matter title is what the board will show."""
+    slug = "%s-%s-%s" % (prefix, code, _slugify(title))
+    epic_dir = os.path.join(root, "tickets", slug)
+    os.makedirs(os.path.join(epic_dir, "open"), exist_ok=True)
+    os.makedirs(os.path.join(epic_dir, "closed"), exist_ok=True)
+    charter = os.path.join(epic_dir, slug + ".md")
+    if not os.path.exists(charter):
+        _write(charter,
+               "---\nid: %s-%s\ntitle: %s\nstatus: OPEN\nindex_exempt: true\n---\n\n"
+               "# %s-%s · %s %s\n\n_What this epic covers, and what \"done\" looks "
+               "like._\n\nDrop tickets in `open/`; move them to `closed/` when you "
+               "like — a ticket's real state is its `status:` field, not the folder.\n"
+               % (prefix, code, title, prefix, code, emoji, title))
+    return epic_dir
+
+
+def _ask(question, default=""):
+    try:
+        return input(question).strip() or default
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def _ask_yn(question, default=True):
+    if not sys.stdin.isatty():
+        return False                      # never prompt in a pipe/CI
+    ans = _ask("%s [%s] " % (question, "Y/n" if default else "y/N")).lower()
+    return default if not ans else ans.startswith("y")
+
+
+def _epic_wizard(root, prefix, taken):
+    """Prompt for epics until a blank line. Returns {"E001": {title, emoji}, ...}."""
+    print("\n  One epic per line, blank line when you're done.")
+    print("  Format:  Title            (or)   Title | 🎭\n")
+    made = {}
+    taken = set(taken)
+    while True:
+        code = _next_code(taken)
+        line = _ask("  %s-%s  title> " % (prefix, code))
+        if not line:
+            break
+        title, _, emoji = line.partition("|")
+        title, emoji = title.strip(), emoji.strip() or "🎟️"
+        if not title:
+            continue
+        _create_epic(root, prefix, code, title, emoji)
+        made[code] = {"title": title, "emoji": emoji}
+        taken.add(code)
+        print("      ✓ created tickets/%s-%s-%s/  %s %s"
+              % (prefix, code, _slugify(title), emoji, title))
+    return made
+
+
+def _merge_epics_into_config(root, made):
+    """Fold wizard-created epics into an existing config.json, preserving the rest."""
+    path = os.path.join(root, server.CONFIG_REL)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            conf = json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return False
+    epics = conf.get("epics") or {}
+    epics.update(made)
+    conf["epics"] = epics
+    _write(path, json.dumps(conf, indent=2, ensure_ascii=False) + "\n")
+    return True
+
+
+def cmd_epics(args):
+    """Add epics to a repo that's already set up."""
+    root = os.path.abspath(args.path or os.getcwd())
+    conf = server.load_config(root)
+    if not conf:
+        sys.exit("interfacile epics: no .interfacile/config.json here — run "
+                 "`interfacile init` first.")
+    prefix = conf.get("ids", {}).get("prefix", "TK")
+    taken = server.discover_epic_meta(os.path.join(root, "tickets"), prefix)
+    if taken:
+        print("existing epics: " + ", ".join(
+            "%s-%s %s" % (prefix, c, t) for c, t in sorted(taken.items())))
+    made = _epic_wizard(root, prefix, taken)
+    if not made:
+        print("nothing to do.")
+        return
+    _merge_epics_into_config(root, made)
+    print("\n• created %d epic(s) and added them to %s"
+          % (len(made), os.path.join(server.CONFIG_REL)))
+    print("Refresh the dashboard — no restart needed.")
+
+
+def _install_skills(root, prefix, force=False):
+    """Drop the ticket-flow skills + process doc into the repo and report."""
+    done = scaffold.install(root, prefix, force=force)
+    changed = [(a, p) for a, p in done if a != "kept"]
+    for action, rel in changed:
+        print("• %s %s" % (action, rel))
+    if not changed:
+        print("• skills + process doc already up to date")
+
+
+def cmd_skills(args):
+    root = os.path.abspath(args.path or os.getcwd())
+    if not os.path.isdir(root):
+        sys.exit("interfacile skills: no such directory: " + root)
+    prefix, _ = ticket.id_scheme(root)
+    _install_skills(root, prefix, force=args.force)
+
+
+def cmd_shortcut(args):
+    """Show, set, or clear the single key the hub uses to switch to this repo."""
+    root = os.path.abspath(args.repo or os.getcwd())
+    path = os.path.join(root, server.CONFIG_REL)
+    if not os.path.isfile(path):
+        sys.exit("interfacile shortcut: no %s here — run `interfacile init` first."
+                 % server.CONFIG_REL)
+    conf = server.load_config(root)
+    current = str(conf.get("shortcut", "") or "").strip()
+
+    if args.clear:
+        if not current:
+            print("no shortcut set.")
+            return
+        conf.pop("shortcut", None)
+        _write(path, json.dumps(conf, indent=2, ensure_ascii=False) + "\n")
+        print("shortcut '%s' cleared." % current)
+        return
+
+    if args.key is None:
+        print("shortcut: %s" % (current or "(none)  — set one: interfacile shortcut 1"))
+        return
+
+    key = args.key.strip()
+    if len(key) != 1 or not key.isalnum():
+        sys.exit("interfacile shortcut: KEY must be a single letter or digit.")
+    # A duplicate key would make the hub switch to whichever repo wins; warn early.
+    for other in registry_repos():
+        if os.path.abspath(other) == root:
+            continue
+        taken = str(server.load_config(other).get("shortcut", "") or "").strip()
+        if taken == key:
+            print("note: '%s' is already used by %s" % (key, other))
+    conf["shortcut"] = key
+    _write(path, json.dumps(conf, indent=2, ensure_ascii=False) + "\n")
+    print("shortcut set: press '%s' anywhere in the hub to switch here." % key)
+
+
 def cmd_init(args):
     root = os.path.abspath(args.path or os.getcwd())
     if not os.path.isdir(root):
         sys.exit("interfacile init: no such directory: " + root)
     cfg = os.path.join(root, server.CONFIG_REL)
     existing = server.load_config(root)
+    prefix = ((existing.get("ids", {}).get("prefix") if existing else None)
+              or _infer_prefix(root) or _fallback_prefix(root))
+
+    # Epics/tickets first: the config we write below names the epics it finds, so
+    # it can only do that once they exist.
+    have = server.discover_epic_meta(os.path.join(root, "tickets"), prefix)
+    made = {}
+    if not have:
+        if not args.no_wizard and _ask_yn("\nCreate some epics now?", default=True):
+            made = _epic_wizard(root, prefix, have)
+        if not made:
+            _seed_tickets(root, prefix)
+            print("• seeded a starter tickets/ tree (%s-E001-getting-started, %s-0001)"
+                  % (prefix, prefix))
+
     if existing:
-        conf = existing
         print("• config already present — leaving it untouched")
+        if made:
+            _merge_epics_into_config(root, made)
+            print("• added %d epic(s) to the existing config" % len(made))
     else:
-        conf = _default_config(root)
+        conf = _default_config(root, prefix)
+        conf["epics"].update(made)        # keep the emoji the wizard collected
         _write(cfg, json.dumps(conf, indent=2, ensure_ascii=False) + "\n")
-        print("• wrote %s  (prefix=%s, brand=%r, theme=blue)"
-              % (cfg, conf["ids"]["prefix"], conf["brand"]["name"]))
+        print("• wrote %s  (prefix=%s, brand=%r, theme=blue, epics=%d)"
+              % (cfg, prefix, conf["brand"]["name"], len(conf["epics"])))
+    if not args.no_skills:
+        _install_skills(root, prefix)
     if _ensure_gitignore(root):
         print("• .gitignore: ignoring .interfacile/ state (pins, scratchpad, to-do), "
               "keeping config.json")
-    prefix = conf.get("ids", {}).get("prefix", "TK")
-    if not os.path.isdir(os.path.join(root, "tickets")):
-        _seed_tickets(root, prefix)
-        print("• seeded a starter tickets/ tree (%s-E001-getting-started, %s-0001)"
-              % (prefix, prefix))
     print("• registered with the hub" if _register(root) else "• already registered")
     print("\nDone. Run `interfacile` here, or `interfacile hub` from anywhere.")
+    print("The flow: interfacile new / tickets / ready / close / lint "
+          "(tickets/README.md explains it).")
 
 
 def cmd_register(args):
@@ -208,8 +391,10 @@ def cmd_list(args):
         conf = server.load_config(r)
         name = conf.get("brand", {}).get("name") or os.path.basename(r)
         icon = conf.get("brand", {}).get("icon") or conf.get("brand", {}).get("favicon") or "•"
+        key = str(conf.get("shortcut", "") or "").strip()
+        key = ("[%s]" % key) if key else "   "
         flag = "" if os.path.isdir(os.path.join(r, "tickets")) else "   [!] missing tickets/"
-        print("  %s  %-22s %s%s" % (icon, name, r, flag))
+        print("  %s %s %-22s %s%s" % (key, icon, name, r, flag))
 
 
 # --------------------------------------------------------------------------- #
@@ -221,14 +406,15 @@ def _add_serve_flags(p):
     p.add_argument("--no-open", action="store_true", help="do not auto-open a browser")
 
 
-def _serve(repos, args):
+def _serve(repos, args, registry_file=None):
     valid = [r for r in repos if os.path.isdir(os.path.join(r, "tickets"))]
     for r in repos:
         if r not in valid:
             sys.stderr.write("skipping (no tickets/): %s\n" % r)
     if not valid:
         sys.exit("interfacile: no repos with a tickets/ folder to serve")
-    server.run(valid, args.port, args.host, not args.no_open)
+    server.run(valid, args.port, args.host, not args.no_open,
+               registry_file=registry_file)
 
 
 def main(argv=None):
@@ -252,6 +438,27 @@ def main(argv=None):
 
     ip = sub.add_parser("init", help="scaffold a repo's .interfacile/config.json and register it")
     ip.add_argument("path", nargs="?", default=None, help="repo root (default: current dir)")
+    ip.add_argument("--no-wizard", action="store_true",
+                    help="don't offer the epic wizard; just seed a starter tree")
+    ip.add_argument("--no-skills", action="store_true",
+                    help="don't install the ticket-flow skills + process doc")
+
+    ep = sub.add_parser("epics", help="create epics interactively (folder + charter)")
+    ep.add_argument("path", nargs="?", default=None, help="repo root (default: current dir)")
+
+    kp = sub.add_parser("skills", help="install/refresh the ticket-flow skills + process doc")
+    kp.add_argument("path", nargs="?", default=None, help="repo root (default: current dir)")
+    kp.add_argument("--force", action="store_true",
+                    help="also overwrite tickets/README.md with the packaged version")
+
+    cp = sub.add_parser("shortcut", help="show/set/clear this repo's hub switcher key")
+    cp.add_argument("key", nargs="?", default=None,
+                    help="single letter or digit; omit to show the current key")
+    cp.add_argument("--clear", action="store_true", help="remove the shortcut")
+    cp.add_argument("--repo", default=None, metavar="PATH",
+                    help="repo root (default: current directory)")
+
+    ticket.add_commands(sub)
 
     rp = sub.add_parser("register", help="add a repo to the hub registry")
     rp.add_argument("path", nargs="?", default=None)
@@ -260,8 +467,9 @@ def main(argv=None):
     sub.add_parser("list", help="list registered interfaces")
 
     # Bare `interfacile` (or leading flags with no subcommand) serves the cwd.
-    known = ("serve", "hub", "init", "register", "unregister", "list",
-             "-h", "--help", "--version")
+    known = (("serve", "hub", "init", "epics", "skills", "shortcut",
+              "register", "unregister", "list",
+              "-h", "--help", "--version") + ticket.COMMANDS)
     if not argv or argv[0] not in known:
         args = ap.parse_args(["serve"] + argv)
     else:
@@ -272,9 +480,20 @@ def main(argv=None):
         if not repos:
             sys.exit("interfacile hub: no repos. Pass --repo PATH (repeatable), or "
                      "`interfacile init`/`register` some (registry: %s)." % registry_path())
-        _serve([os.path.abspath(r) for r in repos], args)
+        # Registry-driven hubs follow registry edits live; explicit --repo
+        # lists are pinned to exactly what was asked for.
+        _serve([os.path.abspath(r) for r in repos], args,
+               registry_file=None if args.repo else registry_path())
+    elif args.cmd in ticket.COMMANDS:
+        sys.exit(args.func(args))
     elif args.cmd == "init":
         cmd_init(args)
+    elif args.cmd == "epics":
+        cmd_epics(args)
+    elif args.cmd == "skills":
+        cmd_skills(args)
+    elif args.cmd == "shortcut":
+        cmd_shortcut(args)
     elif args.cmd == "register":
         cmd_register(args)
     elif args.cmd == "unregister":

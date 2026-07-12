@@ -14,13 +14,13 @@ looks and what id scheme it uses.
 > at the repo root. Move it to `.interfacile/config.json` — the root dotfile is no
 > longer read.
 
-Two ready-made examples in this folder reproduce the current look of each board —
-copy either into your repo as `.interfacile/config.json`:
+Two ready-made examples in this folder — copy either into your repo as
+`.interfacile/config.json` and change the names:
 
-| File | Reproduces |
+| File | Shows |
 |---|---|
-| [`theyre-here.interfacile.json`](theyre-here.interfacile.json) | the `TH-` / violet-neon board (port 8788) |
-| [`clean-paste.interfacile.json`](clean-paste.interfacile.json) | the `EM-` / blue board (port 8787) |
+| [`starter.interfacile.json`](starter.interfacile.json) | the minimal useful config: brand, prefix, a preset theme, a shortcut |
+| [`custom-theme.interfacile.json`](custom-theme.interfacile.json) | everything: named epics, header links, a full custom palette |
 
 ## Fields
 
@@ -40,9 +40,35 @@ copy either into your repo as `.interfacile/config.json`:
 | `digits` | Zero-padded ticket-number width (default `4` → `TH-0001`). |
 
 ### `epics`
-Map of epic code (`E###`, the part after `PREFIX-E`) → `{ "title", "emoji" }`.
-Unknown codes fall back to the bare code and a default emoji, so this is optional
-but it's what makes the epic pages read nicely.
+Map of epic code → `{ "title", "emoji" }`. Both key forms work — the bare code
+(`"E001"`) and the full id (`"AA-E001"`).
+
+Titles resolve in this order, so the section is **optional**:
+
+1. what you put here, if anything;
+2. otherwise the **epic's own charter** — the `title:` in the front-matter of the
+   `PREFIX-E###-*.md` file inside the epic folder;
+3. otherwise the epic folder's slug (`AA-E001-launch-readiness` → *Launch
+   Readiness*);
+4. otherwise the bare code.
+
+Set it anyway if you want emoji, or titles that differ from the charters. The
+quickest way to fill it in is to let the tool do it:
+
+```bash
+interfacile epics     # wizard: creates the folder + charter, and writes this section
+```
+
+```json
+"epics": {
+  "E001": { "title": "Character Development", "emoji": "🎭" },
+  "E002": { "title": "Weekly Blogs",          "emoji": "📅" }
+}
+```
+
+> The engine ships **no** built-in epic names. It used to, and a repo that left
+> `epics` empty would silently inherit them — showing another project's epic
+> titles against its own ids. Titles now always come from your repo.
 
 ### `links` (optional)
 Per-project quick links, rendered as small emoji buttons in the header row next
@@ -130,4 +156,16 @@ distinct key (digits are safest).
 
 `--repo` / CLI flags  ▸  `.interfacile/config.json`  ▸  built-in defaults. A
 missing file, a missing section, or a missing key each fall back to the level
-below, so you can start with a two-line config and grow it.
+below, so you can start with a two-line config and grow it. The built-in defaults
+are deliberately generic — no project's brand, prefix, or epic names are baked
+into the engine.
+
+## Editing a live config
+
+The config is re-read when the file changes, exactly like tickets are: **save
+`config.json`, refresh the page, and it's there.** No restart, even under
+`interfacile hub`.
+
+The registry works the same way: a hub launched without explicit `--repo` flags
+follows registry edits live, so `interfacile init` / `register` / `unregister`
+show up in the switcher on the next refresh.

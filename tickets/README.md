@@ -1,0 +1,59 @@
+# How tickets work here
+
+Tickets are markdown files with YAML frontmatter, organised by epic:
+
+    tickets/
+      IF-E001-some-epic/
+        IF-E001-some-epic.md        <- the epic charter
+        open/
+          IF-0001-do-the-thing.md
+        closed/
+          IF-0002-already-done.md
+
+Everything is driven by the `interfacile` CLI — no loose scripts. Run
+`interfacile` (no arguments) in this repo to see the live board.
+
+## The flow
+
+| Step                        | Command                                                |
+|-----------------------------|--------------------------------------------------------|
+| See the board               | `interfacile tickets` (`--all` includes closed)        |
+| See what can start now      | `interfacile ready`                                    |
+| Create a ticket             | `interfacile new "Title" --epic E001`                  |
+| Read one ticket             | `interfacile show IF-0001`                     |
+| Check its dependencies      | `interfacile deps IF-0001`                     |
+| Finish one                  | `interfacile close IF-0001 --note "what shipped"` |
+| Keep the tree honest        | `interfacile lint`                                     |
+| Add an epic                 | `interfacile epics`                                    |
+
+## A ticket's frontmatter
+
+    ---
+    id: IF-0001
+    title: Short imperative title
+    epic: IF-E001
+    status: OPEN                    # OPEN | CLOSED | WONT_FIX | STANDING
+    risk: LOW                       # LOW | MEDIUM | HIGH
+    priority: 3                     # 1 (do first) .. 5 (someday)
+    effort: 2h                      # 30m 1h 2h 4h 1d 2d 1w ...
+    created: 2026-01-01
+    depends_on: [IF-0002]   # optional; only real ticket ids
+    ---
+
+The body carries three sections: **Context** (why), **Approach** (how), and
+**Acceptance criteria** (checkboxes that define "done").
+
+## Three rules
+
+1. **A ticket's real state is its `status:` field.** The `open/` and `closed/`
+   folders are for humans browsing the tree; `interfacile close` keeps them in
+   step so you never have to.
+2. **"Blocked" is never a status — it is derived.** A ticket is blocked while
+   anything in its `depends_on` is still open, and unblocks by itself the
+   moment the dependency closes.
+3. **`interfacile lint` is the referee.** It validates ids, required fields,
+   statuses, dates, and the dependency graph. Run it after any hand edit.
+
+Agent skills for this flow live in `.claude/skills/` (`new-ticket`,
+`work-ticket`, `close-ticket`, `ticket-status`). Reinstall or update them any
+time with `interfacile skills`.

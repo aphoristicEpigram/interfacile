@@ -36,6 +36,9 @@ looks, alongside the (git-ignored) scratchpad, to-do, and pin state.
   remaining, dependency chains, per-epic breakdowns, health KPIs.
 - 🛰️ **Multi-interface hub** — serve many repos from one process and switch
   between them with a dropdown or a **per-project keyboard shortcut**.
+- 🎫 **A built-in ticket flow** — `new`, `tickets`, `ready`, `close`, `lint`
+  straight from the CLI, plus agent skills (`new-ticket`, `work-ticket`,
+  `close-ticket`, `ticket-status`) that `init` installs into your repo.
 - 🎨 **14 theme presets + custom palettes** — each interface gets a distinctive
   background so you always know which project you're in. Light & dark automatic.
 - 🧰 **Zero dependencies** — standard-library Python 3.8+, one command to install.
@@ -118,12 +121,40 @@ interfacile init
 That single command does everything:
 
 - writes `.interfacile/config.json`
-- seeds a starter `tickets/` tree, if the repo hasn't got one
+- **offers a wizard to create your first epics** (see below)
+- installs the **ticket-flow skills** into `.claude/skills/` and a
+  `tickets/README.md` process doc (skip with `--no-skills`)
 - adds the `.gitignore` rules
 - registers the repo with the hub
 
 It is **safe to re-run** — an existing config, registration, and ignore rule are
 all left alone.
+
+The wizard just asks for a title per line, and an optional emoji after a `|`:
+
+```
+Create some epics now? [Y/n] y
+
+  One epic per line, blank line when you're done.
+  Format:  Title            (or)   Title | 🎭
+
+  AA-E001  title> Character Development | 🎭
+      ✓ created tickets/AA-E001-character-development/  🎭 Character Development
+  AA-E002  title> Weekly Blogs | 📅
+      ✓ created tickets/AA-E002-weekly-blogs/  📅 Weekly Blogs
+  AA-E003  title>
+```
+
+Each epic gets a folder, `open/` and `closed/` bays, and a charter — and is
+written into your config. Decline (or pass `--no-wizard`) and you get a starter
+`tickets/` tree instead. It never prompts when stdin isn't a terminal, so it's
+safe in scripts and CI.
+
+Add more epics to a repo later with:
+
+```bash
+interfacile epics          # same wizard, continues the numbering
+```
 
 **3. Look at it.**
 
@@ -131,17 +162,22 @@ all left alone.
 interfacile          # serves this repo, opens your browser
 ```
 
-**4. Add it to your hub.** The hub reads the registry **at startup**, so a newly
-`init`-ed repo only shows up in the switcher after you **restart** it:
+**4. Add it to your hub.**
 
 ```bash
 interfacile hub
 ```
 
+A hub that's already running picks the new repo up by itself — the registry is
+re-read when it changes, so the switcher updates on your next refresh.
+
 **5. Make it yours (optional).** Edit the generated `.interfacile/config.json` to
 set the brand name, favicon, epics, theme, `shortcut` (give each repo a distinct
 key), and `server.port` (give each repo a distinct port). See
 [Configuring an interface](#configuring-an-interface).
+
+Save the file and **refresh** — the config is re-read on change, so you don't
+need to restart anything to see it.
 
 ### What `init` decides for you
 
@@ -180,8 +216,17 @@ interfacile hub --repo /path/to/repo-a --repo /path/to/repo-b
 
 The registry lives at `~/.config/interfacile/registry.json`. The hub opens at a
 tidy branded loopback URL like `http://interfacile.localhost:8788/` (plain
-`http://localhost:8788/` works too). Assign each interface a `shortcut` in its
-config to jump straight to it from anywhere.
+`http://localhost:8788/` works too). Give each repo a switcher key and you can
+jump straight to it from anywhere in the hub:
+
+```bash
+interfacile shortcut 3        # press '3' anywhere in the hub to switch here
+interfacile shortcut          # show the current key
+interfacile shortcut --clear  # remove it
+```
+
+Setting a key warns if another registered repo already uses it, and
+`interfacile list` shows every repo's key.
 
 ## Configuring an interface
 
@@ -239,9 +284,36 @@ One folder per epic; the `open/` and `closed/` subfolders are for humans — a
 ticket's real state is its `status:` field. See a live example under
 [`examples/tickets/`](examples/tickets/).
 
-The repo also carries a ticket **hygiene** engine
-([`scripts/ticket_hygiene/`](scripts/ticket_hygiene/) — lint, audit, index,
-health) and optional **git hooks** ([`scripts/git-hooks/`](scripts/git-hooks/)).
+## The ticket flow
+
+You never hand-write ids, frontmatter, or filenames — the CLI owns them, and
+everything is driven by your repo's config (no hardcoded prefixes anywhere):
+
+```bash
+interfacile new "Ship the widget" --epic E001   # next free id, right folder
+interfacile tickets                             # the board, grouped by epic
+interfacile ready                               # what can start now, P1 first
+interfacile show  TK-0002                       # one ticket, path + contents
+interfacile deps  TK-0002                       # what it waits on / what waits on it
+interfacile close TK-0002 --note "shipped"      # status+dates+move, in one step
+interfacile lint                                # ids, fields, dates, dep graph
+```
+
+Two ideas keep it simple: **"blocked" is never a status** — a ticket is blocked
+while anything in its `depends_on` is still open, and unblocks itself when that
+closes (`close` even tells you what it just unblocked); and **`lint` is the
+referee** after any hand edit.
+
+Changed your mind? `interfacile reopen ID` undoes a close, and
+`interfacile drop ID --why "..."` records a deliberate WONT_FIX (which
+unblocks dependants just like closing). For scripts, CI, and agents,
+`tickets`, `ready`, `show`, and `lint` all take `--json`.
+
+`interfacile init` also drops four agent skills (`new-ticket`, `work-ticket`,
+`close-ticket`, `ticket-status`) into `.claude/skills/` and the process doc
+into `tickets/README.md`, so an agent working in your repo follows the same
+flow. Refresh them any time with `interfacile skills` — the files are
+version-stamped, and `lint` nudges you when they're stale.
 
 ## Troubleshooting
 
@@ -270,14 +342,31 @@ sudo ln -s /full/path/to/interfacile/venv/bin/interfacile /usr/local/bin/interfa
 You don't have `pipx`, and you don't need it. Use **Route B** in
 [Install](#install) instead — venv + symlink, no extra tools.
 
+### My board shows another project's epic names
+
+Fixed — but if you're on an older build, that's the symptom. The engine used to
+ship a set of built-in epic names, and any repo whose config left `epics` empty
+would silently inherit them, pinned to its own ids (`AA-E001 · PII Detection
+Core`). Update, and titles come from your repo — your config, else your epic
+charters. See [`examples/configs/`](examples/configs/).
+
+### I edited `config.json` and nothing changed
+
+The config is re-read whenever the file changes, so a refresh is enough. If
+you're on an older build it was only read at **startup** — restart the server.
+
 ### My new repo isn't in the hub's switcher
 
-The hub reads the registry **once, at startup**. **Restart `interfacile hub`.**
-Confirm the repo actually registered with:
+Refresh the page — a registry-driven hub follows `init`/`register`/`unregister`
+live. (A hub started with explicit `--repo` flags is pinned to exactly those
+repos on purpose.) Confirm the repo actually registered with:
 
 ```bash
 interfacile list
 ```
+
+Repos without a `tickets/` folder are skipped; run `interfacile init` in them
+first.
 
 ### `interfacile: no repos with a tickets/ folder to serve`
 
@@ -293,6 +382,13 @@ interfacile only serves a repo that has a `tickets/` directory. Run
   (chosen by an `ifc` cookie) under a lock — correct for this local, single-user
   server.
 
+## Development
+
+```bash
+python3 -m venv venv && ./venv/bin/pip install -e .
+./venv/bin/python -m unittest discover tests    # no test dependencies either
+```
+
 ## Contributing
 
 Contributions welcome — bug reports, colour presets, docs, features. See
@@ -306,7 +402,7 @@ Contributions welcome — bug reports, colour presets, docs, features. See
 ## Roadmap
 
 Consolidation, per-repo config, the multi-interface hub, packaging, `init` +
-registry, and custom palettes are all **shipped**. What's next is tracked on
-interfacile's own board (run `interfacile` in this repo, or browse
-[`tickets/`](tickets/)): PyPI + CI, ticket creation from the CLI and dashboard, a
-portfolio landing page, live reload, and more.
+registry, custom palettes, and the CLI ticket flow (+ scaffolded agent skills)
+are all **shipped**. What's next is tracked on interfacile's own board (run
+`interfacile` in this repo, or browse [`tickets/`](tickets/)): PyPI + CI,
+in-dashboard ticket creation, a portfolio landing page, live reload, and more.

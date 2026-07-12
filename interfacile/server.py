@@ -37,50 +37,26 @@ REPO_ROOT = os.path.abspath(
 )
 TICKETS_DIR = os.path.join(REPO_ROOT, "tickets")
 
-EPIC_TITLES = {
-    "E001": "PII Detection Core",
-    "E002": "Product Surface & MCP",
-    "E003": "Swift macOS App",
-    "E004": "Launch Readiness",
-    "E005": "Rust Production Port",
-    "E006": "Developer Marketing",
-    "E007": "Gazetteer & Detection Data",
-    "E008": "Native Swift Layer",
-    "E009": "Engine Architecture",
-    "E010": "Entity Model & Adjacency",
-    "E011": "Performance & Stability",
-    "E012": "Conflict Resolution",
-    "E013": "Commercialisation",
-    "E014": "Distribution & Packaging",
-    "E015": "Onboarding & Starter Packs",
-    "E017": "Document Model & Domains",
-    "E018": "Security & Adversarial",
-    "E019": "Session Layer",
-    "E020": "Process & Ticket Hygiene",
-    "E021": "CI & Dev Tooling",
-    "E022": "Output Formatting Modes",
-    "E023": "Domain Implementations",
-}
-
-EPIC_EMOJI = {
-    "E001": "🔍", "E002": "🔌", "E003": "🍎", "E004": "🚀", "E005": "🦀",
-    "E006": "📣", "E007": "🗺️", "E008": "🐦", "E009": "⚙️", "E010": "🧩",
-    "E011": "⚡", "E012": "⚖️", "E013": "💰", "E014": "📦", "E015": "🧭",
-    "E017": "📄", "E018": "🛡️", "E019": "🧵", "E020": "🧹", "E021": "🔧",
-    "E022": "🎨", "E023": "🏗️",
-}
+# Deliberately empty. Epic names belong to an interface, never to the engine —
+# a repo gets them from its own .interfacile/config.json, or, failing that, from
+# its own epic charters (discover_epic_meta). Seeding these with one project's
+# epics silently leaks them into every repo that doesn't list its own.
+EPIC_TITLES = {}
+EPIC_EMOJI = {}
 # --------------------------------------------------------------------------- #
 # Per-interface identity. These module-level names are the *live* values the
 # rest of the server reads; they start at the built-in defaults below and are
 # overwritten from a repo's .interfacile/config.json at startup by apply_config().
 # --------------------------------------------------------------------------- #
-PFX = "EM"                       # ticket id prefix: <PFX>-1234, <PFX>-E001
+# These are engine defaults, so they must stay generic: anything project-flavoured
+# here becomes the fallback that an under-specified repo silently inherits.
+PFX = "TK"                       # ticket id prefix: <PFX>-1234, <PFX>-E001
 ID_DIGITS = 4                    # zero-padded ticket-number width
-BRAND = "Clean Paste"            # <h1> / page-title name
+BRAND = "Tickets"                # <h1> / page-title name
 FAVICON = "🎟️"                   # browser-tab icon glyph
 HEADER_ICON = "🎟️"               # mark shown beside the title (defaults to favicon)
 EYEBROW = "Ticket portfolio &middot; engineering program"
-TAGLINE = "The PII-firewall build tracked as"
+TAGLINE = "This project is tracked as"
 SERVER_PORT = 8787               # default listen port (config/--port override)
 THEME_REMAP = {}                 # canonical(blue)->theme hex map; {} == blue
 THEME_STRIP = None               # signature-strip colours, or None
@@ -429,9 +405,63 @@ def _working_tree_ids():
         return set()
 
 
+_EPIC_KEY_RE = re.compile(r"(?:[A-Za-z]+-)?(E\d+)$")
+
+
+def _epic_key(key):
+    """Normalise a config `epics` key to the bare code the engine looks up.
+    Both "E001" and the full "AA-E001" are accepted — writing the full id is the
+    natural thing to do, and it used to be silently ignored."""
+    m = _EPIC_KEY_RE.match(str(key).strip())
+    return m.group(1) if m else str(key).strip()
+
+
+def discover_epic_meta(tickets_dir=None, prefix=None):
+    """Epic titles taken from the repo's *own* epic charters: {"E001": "Launch"}.
+
+    This is what lets a repo with no `epics` in its config still show real names
+    instead of bare codes. The title comes from the charter's front-matter, and
+    failing that from the epic folder's slug (TK-E001-launch-readiness -> "Launch
+    Readiness"). Config `epics` still wins over anything found here.
+    """
+    tickets_dir = TICKETS_DIR if tickets_dir is None else tickets_dir
+    prefix = PFX if prefix is None else prefix
+    code_re = re.compile(r"%s-(E\d+)-?(.*)$" % re.escape(prefix))
+    titles = {}
+    for d in sorted(glob.glob(os.path.join(tickets_dir, "%s-E*" % prefix))):
+        m = code_re.match(os.path.basename(d))
+        if not (m and os.path.isdir(d)):
+            continue
+        code, slug = m.group(1), m.group(2)
+        title = ""
+        for charter in sorted(glob.glob(os.path.join(d, "*.md"))):
+            fm_lines, _ = split_frontmatter(read_text(charter))
+            fm = {k: v for k, v in frontmatter_scalars(fm_lines)}
+            if fm.get("id", "") == "%s-%s" % (prefix, code):
+                title = fm.get("title", "").strip()
+                break
+        titles[code] = title or (slug.replace("-", " ").title() if slug else code)
+    return titles
+
+
+def _epic_record(code, found_titles):
+    """A zeroed epic. Title: config wins, else the repo's own charter, else the code."""
+    return {
+        "id": code,
+        "title": EPIC_TITLES.get(code) or found_titles.get(code) or code,
+        "emoji": EPIC_EMOJI.get(code, "🎟️"),
+        "open": 0, "closed": 0, "wf": 0, "standing": 0,
+        "openTickets": [], "closedTickets": [], "wfTickets": [],
+        "standingTickets": [],
+        "lastCreated": None, "lastClosed": None,
+        "effortOpenH": 0.0, "effortDoneH": 0.0,
+    }
+
+
 def scan():
     """Walk tickets/, aggregate per-epic counts, and build a weekly time-series."""
     epics = {}
+    found_titles = discover_epic_meta()   # charter-derived; config still wins
     id_index = {}
     all_created = []
     all_closed = []
@@ -492,15 +522,7 @@ def scan():
             if tid in wip_ids:
                 wip_list.append((mt, dict(rec, when=datetime.datetime
                                           .fromtimestamp(mt).isoformat())))
-        ep = epics.setdefault(code, {
-            "id": code, "title": EPIC_TITLES.get(code, code),
-            "emoji": EPIC_EMOJI.get(code, "🎟️"),
-            "open": 0, "closed": 0, "wf": 0, "standing": 0,
-            "openTickets": [], "closedTickets": [], "wfTickets": [],
-            "standingTickets": [],
-            "lastCreated": None, "lastClosed": None,
-            "effortOpenH": 0.0, "effortDoneH": 0.0,
-        })
+        ep = epics.setdefault(code, _epic_record(code, found_titles))
         for field in ("depends_on", "blocks"):
             for dep in DEP_ID_RE.findall(fm.get(field, "")):
                 if dep != tid:
@@ -551,6 +573,12 @@ def scan():
             closed_effort.append((xdate, effort_h or 0.0))
             if ep["lastClosed"] is None or xdate > ep["lastClosed"]:
                 ep["lastClosed"] = xdate
+
+    # Epics that exist as a folder + charter but have no tickets yet (a freshly
+    # created one). Without this they'd be invisible until their first ticket
+    # landed, which makes `interfacile epics` look like it did nothing.
+    for code in found_titles:
+        epics.setdefault(code, _epic_record(code, found_titles))
 
     # Dependency resolution: an open ticket is blocked when an open blocker
     # precedes it; unblocks = how many open tickets it is holding up.
@@ -1202,7 +1230,7 @@ def render_ticket_page(path, known_ids=None, known_epics=None, adrs=None,
     if em:
         code = "E" + em.group(1)
         epic_crumb = ('&nbsp;&middot;&nbsp; <a class="back" href="/epic/' + code
-                      + '">epic EM-' + code + ' &rarr;</a>')
+                      + '">epic __PFX__-' + code + ' &rarr;</a>')
 
     parent, kids = _family(tid, id_index or {})
     parent_crumb = ""
@@ -1218,7 +1246,7 @@ def render_ticket_page(path, known_ids=None, known_epics=None, adrs=None,
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>" + html.escape(tid) + " &middot; ticket</title>"
         "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'"
-        " viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎟️</text></svg>\">"
+        " viewBox='0 0 100 100'><text y='.9em' font-size='90'>__FAVICON__</text></svg>\">"
         "<style>" + TICKET_CSS + "</style></head><body>"
         "<div class='wrap' id='ticketRoot' data-id='" + html.escape(tid) + "'>"
         "<a class='back' href='/'>&larr; back to dashboard</a>" + epic_crumb
@@ -1286,7 +1314,7 @@ def render_doc_page(path, known_ids=None, known_epics=None, adrs=None):
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>" + html.escape(os.path.basename(path)) + " &middot; doc</title>"
         "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'"
-        " viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎟️</text></svg>\">"
+        " viewBox='0 0 100 100'><text y='.9em' font-size='90'>__FAVICON__</text></svg>\">"
         "<style>" + TICKET_CSS + "</style></head><body><div class='wrap'>"
         "<a class='back' href='/'>&larr; back to dashboard</a>"
         "<div class='tid'>" + rel + "</div>"
@@ -1323,9 +1351,9 @@ def render_adr_page(recs, by_num):
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>ADRs &middot; Clean Paste</title>"
+        "<title>ADRs &middot; __BRAND__</title>"
         "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'"
-        " viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎟️</text></svg>\">"
+        " viewBox='0 0 100 100'><text y='.9em' font-size='90'>__FAVICON__</text></svg>\">"
         "<style>" + EPIC_CSS + "</style></head><body><div class='wrap'>"
         "<a class='back' href='/'>&larr; back to dashboard</a>"
         "<div class='ehead'>"
@@ -1409,7 +1437,7 @@ border:1px solid var(--line);border-radius:7px;padding:5px 9px;cursor:pointer}
 .col.cards li a{display:flex;flex-direction:column;align-items:stretch;gap:8px;
 background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:14px 16px}
 .col.cards li a:hover{border-color:var(--accent);background:var(--surface)}
-/* family card: parent + its EM-####-X sub-tickets joined in one cell */
+/* family card: parent + its __PFX__-####-X sub-tickets joined in one cell */
 .col.cards li.fam{border:1px solid var(--line);border-radius:9px;background:var(--surface);overflow:hidden}
 .col.cards li.fam ul{display:block;margin:0;padding:0}
 .col.cards li.fam li a{border:0;border-radius:0;height:auto}
@@ -1431,7 +1459,7 @@ background:var(--surface);border:1px solid var(--line);border-radius:9px;padding
 # dashboard backlog controls (search / risk / priority / effort / blocked).
 LIST_FILTER_BAR = """
 <div class="fbar">
-  <input id="lfSearch" class="searchbox" type="search" placeholder="search EM-#### or title"
+  <input id="lfSearch" class="searchbox" type="search" placeholder="search __PFX__-#### or title"
          autocomplete="off" aria-label="Filter tickets by id or title">
   <label class="sortlab">risk <select id="lfRisk" class="sortsel">
     <option value="">all</option><option value="HIGH">high</option>
@@ -1574,7 +1602,7 @@ def _epic_ticket_li(t, is_child, datekey, today, show_epic=False):
     if show_epic and t.get("epic"):
         ec = html.escape(t["epic"])
         chips += ('<span class="mchip epic-link" role="link" tabindex="0" data-epic="%s"'
-                  ' title="open the EM-%s epic page">EM-%s</span>' % (ec, ec, ec))
+                  ' title="open the __PFX__-%s epic page">__PFX__-%s</span>' % (ec, ec, ec))
     if t.get("risk"):
         chips += '<span class="mchip r-%s">%s</span>' % (t["risk"].lower(), t["risk"][0])
     if t.get("priority"):
@@ -1639,7 +1667,7 @@ def _ticket_card(t, is_child, datekey, today, show_epic=True):
         ec = html.escape(t["epic"])
         emo = EPIC_EMOJI.get(t["epic"], "")
         chips += ('<span class="mchip epic-link" role="link" tabindex="0" data-epic="%s"'
-                  ' title="open the EM-%s epic page">%sEM-%s</span>'
+                  ' title="open the __PFX__-%s epic page">%s__PFX__-%s</span>'
                   % (ec, ec, (emo + " ") if emo else "", ec))
     if t.get("risk"):
         chips += ('<span class="mchip r-%s">%s risk</span>'
@@ -1759,14 +1787,14 @@ def render_epic_page(ep):
     page = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>" + html.escape("EM-" + ep["id"]) + " &middot; epic</title>"
+        "<title>" + html.escape("__PFX__-" + ep["id"]) + " &middot; epic</title>"
         "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'"
-        " viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎟️</text></svg>\">"
+        " viewBox='0 0 100 100'><text y='.9em' font-size='90'>__FAVICON__</text></svg>\">"
         "<style>" + EPIC_CSS + "</style></head><body><div class='wrap'>"
         "<a class='back' href='/'>&larr; back to dashboard</a>" + charter_link +
         "<div class='ehead'>"
-        "<div class='tid'>EM-" + html.escape(ep["id"]) + epic_copy + "</div>"
-        "<h1 class='title'><span class='e-emoji'>" + ep.get("emoji", "🎟️")
+        "<div class='tid'>__PFX__-" + html.escape(ep["id"]) + epic_copy + "</div>"
+        "<h1 class='title'><span class='e-emoji'>" + ep.get("emoji", "__FAVICON__")
         + "</span>" + html.escape(ep["title"]) + "</h1>"
         "<div class='bar' role='img' aria-label='" + str(ep["closed"]) + " closed, "
         + str(ep["open"]) + " open, " + str(ep["wf"]) + " won&#39;t-fix'>"
@@ -1909,9 +1937,9 @@ def render_filter_page(data, q):
     page = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>" + html.escape(label) + " &middot; Clean Paste</title>"
+        "<title>" + html.escape(label) + " &middot; __BRAND__</title>"
         "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'"
-        " viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎟️</text></svg>\">"
+        " viewBox='0 0 100 100'><text y='.9em' font-size='90'>__FAVICON__</text></svg>\">"
         "<style>" + EPIC_CSS + extra_css + "</style></head><body><div class='wrap'>"
         "<a class='back' href='/'>&larr; back to dashboard</a>"
         "<div class='ehead'>"
@@ -1935,8 +1963,8 @@ def render_filter_page(data, q):
 # --------------------------------------------------------------------------- #
 DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Clean Paste &middot; Ticket Dashboard</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎟️</text></svg>">
+<title>__BRAND__ &middot; Ticket Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>__FAVICON__</text></svg>">
 <style>
 :root{--ground:#e9edf1;--surface:#fff;--surface-2:#f3f6f9;--ink:#101720;--ink-2:#3a4652;
 --ink-mut:#5d6a77;--line:#d6dde5;--line-2:#e6ebf0;--accent:#2b53e6;--accent-ink:#1c3bb3;
@@ -2392,7 +2420,7 @@ section.collapsed .sec-head{margin-bottom:0}
 <div class="page"><div class="wrap">
   <header class="head">
     <div class="head-top">
-      <span class="eyebrow">Ticket portfolio &middot; engineering program</span>
+      <span class="eyebrow">__EYEBROW__</span>
       <span class="head-btns">
         <a id="ghBtn" class="ghbtn" hidden target="_blank" rel="noopener">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -2405,13 +2433,13 @@ section.collapsed .sec-head{margin-bottom:0}
         <button class="regen" id="regen" type="button"><span class="ic">&#8635;</span> Regenerate</button>
       </span>
     </div>
-    <h1>Clean Paste <span class="h-emo" aria-hidden="true">__HDR_ICON__</span></h1>
+    <h1>__BRAND__ <span class="h-emo" aria-hidden="true">__HDR_ICON__</span></h1>
     <div class="tag-row">
       <p class="tagline" id="tagline">Scanning tickets&hellip;</p>
     </div>
     <div class="gsearch-row">
       <input id="gsearch" class="gsearch" type="search" autocomplete="off" spellcheck="false"
-             placeholder="Jump to a ticket or epic &mdash; EM-1234, E019, or title&hellip;"
+             placeholder="Jump to a ticket or epic &mdash; __PFX__-1234, E001, or title&hellip;"
              aria-label="Search tickets and epics" role="combobox" aria-expanded="false" aria-controls="gdrop">
       <span class="g-hint">/</span>
       <div class="gdrop" id="gdrop" hidden></div>
@@ -2555,7 +2583,7 @@ section.collapsed .sec-head{margin-bottom:0}
   <section id="sec-backlog">
     <div class="sec-head"><h2><span class="h-num">04</span>Backlog</h2>
       <div class="backlog-tools">
-        <input id="tsearch" class="searchbox" type="search" placeholder="search EM-#### or title" autocomplete="off" aria-label="Search tickets by number or title">
+        <input id="tsearch" class="searchbox" type="search" placeholder="search __PFX__-#### or title" autocomplete="off" aria-label="Search tickets by number or title">
         <label class="sortlab">risk
           <select id="fRisk" class="sortsel">
             <option value="">all</option>
@@ -2637,7 +2665,7 @@ section.collapsed .sec-head{margin-bottom:0}
     <div class="epics" id="epicList"></div>
   </section>
   <footer>
-    <p><span class="mono">Live scan</span> of <span class="mono" id="foot-src">tickets/</span> frontmatter &mdash; counts every ticket file (<span class="mono">id: EM-####</span>), including compound sub-tickets, so totals reflect real files on disk rather than the generated index.</p>
+    <p><span class="mono">Live scan</span> of <span class="mono" id="foot-src">tickets/</span> frontmatter &mdash; counts every ticket file (<span class="mono">id: __PFX__-####</span>), including compound sub-tickets, so totals reflect real files on disk rather than the generated index.</p>
     <p><span class="mono" id="foot-time">&nbsp;</span></p>
   </footer>
 </div></div>
@@ -2694,8 +2722,9 @@ section.collapsed .sec-head{margin-bottom:0}
       || idl.replace("em-","").indexOf(q.replace(/^em-?/,""))!==-1
       || t.title.toLowerCase().indexOf(q)!==-1;
   }
+  function epTotal(e){return e.open+e.closed+e.wf+(e.standing||0);}
   function statusOf(e){
-    if(e.id==="E019"&&e.open>0) return {cls:"chip-active",txt:"Active WIP"};
+    if(epTotal(e)===0) return {cls:"chip-notstarted",txt:"Empty"};
     if(e.open===0) return {cls:"chip-complete",txt:"Complete"};
     if(e.closed===0) return {cls:"chip-notstarted",txt:"Not started"};
     if(e.open<=2) return {cls:"chip-finish",txt:"Finishing"};
@@ -2728,12 +2757,12 @@ section.collapsed .sec-head{margin-bottom:0}
     var ep=null;d.epics.forEach(function(e){if(e.id===lw.epic)ep=e;});
     host.innerHTML='<div class="lw">'+
       (ep?'<a class="lw-row" href="/epic/'+ep.id+'"><span class="lw-k">epic</span>'+
-        '<span class="g-emo">'+(ep.emoji||"")+'</span><span class="b-tid">EM-'+ep.id+'</span>'+
+        '<span class="g-emo">'+(ep.emoji||"")+'</span><span class="b-tid">__PFX__-'+ep.id+'</span>'+
         '<span class="b-ttl">'+esc(ep.title)+'</span>'+
         '<span class="b-date">'+(ep.open||0)+' open</span></a>':'')+
       '<a class="lw-row" href="/ticket/'+encodeURIComponent(lw.ticket)+'">'+
         '<span class="lw-k">ticket</span>'+
-        '<span class="g-emo">🎟️</span>'+
+        '<span class="g-emo">__FAVICON__</span>'+
         '<span class="b-tid">'+esc(lw.ticket)+'</span>'+
         '<span class="b-ttl">'+esc(lw.title||"")+
         (lw.wip?'<span class="b-dec">WIP</span>':'')+'</span>'+
@@ -2938,7 +2967,7 @@ section.collapsed .sec-head{margin-bottom:0}
       });
       var t=byId[id]||{title:""};
       var chips=[t.priority?"P"+t.priority:"",t.risk||"",t.effort||"",
-                 t.epic?"EM-"+t.epic:"",t.wip?"WIP":""].filter(Boolean).join(" · ");
+                 t.epic?"__PFX__-"+t.epic:"",t.wip?"WIP":""].filter(Boolean).join(" · ");
       tip.innerHTML='<b>'+esc(id)+'</b>'+esc(t.title||"")+
         (chips?'<div class="row"><span class="k">'+esc(chips)+'</span></div>':'')+
         '<div class="row"><span class="k">blocked by</span><span>'+
@@ -3108,7 +3137,7 @@ section.collapsed .sec-head{margin-bottom:0}
   function renderHeader(d){
     var t=d.totals, resolved=t.total?((t.closed+t.wf)/t.total*100):0;
     document.getElementById("tagline").innerHTML=
-      'The PII-firewall build tracked as <b>'+t.total.toLocaleString()+' tickets</b> across '+d.epics.length+
+      '__TAGLINE__ <b>'+t.total.toLocaleString()+' tickets</b> across '+d.epics.length+
       ' epics. <b>'+resolved.toFixed(1)+'%</b> resolved; <b>'+t.open+'</b> still open.';
     document.getElementById("stamp").textContent="live scan · "+d.generated;
     document.getElementById("foot-src").textContent=d.source+"/";
@@ -3149,13 +3178,13 @@ section.collapsed .sec-head{margin-bottom:0}
     var openEpics=d.epics.filter(function(e){return e.open>0;}).length;
     document.getElementById("k-open-sub").textContent="across "+openEpics+" epics"+
       ((h.wipOpen||0)?" · "+h.wipOpen+" WIP":"");
-    var complete=d.epics.filter(function(e){return e.open===0;}).length;
+    var complete=d.epics.filter(function(e){return e.open===0&&epTotal(e)>0;}).length;
     var finishing=d.epics.filter(function(e){return e.open===1;}).length;
     document.getElementById("k-complete").textContent=complete;
     document.getElementById("k-complete-sub").textContent=finishing+" more at 1 open";
   }
   function renderTracks(d){
-    var complete=d.epics.filter(function(e){return e.open===0;});
+    var complete=d.epics.filter(function(e){return e.open===0&&epTotal(e)>0;});
     var finishing=d.epics.filter(function(e){return e.open===1;});
     var notStarted=d.epics.filter(function(e){return e.open>0&&e.closed===0;});
     var nsOpen=notStarted.reduce(function(a,e){return a+e.open;},0);
@@ -3188,13 +3217,14 @@ section.collapsed .sec-head{margin-bottom:0}
       return '<a class="etile" href="/epic/'+e.id+'" title="'+esc(e.title)+' — '+
           e.closed+' closed · '+e.open+' open · '+e.wf+' won\'t-fix">'+
         '<span class="et-emo">'+(e.emoji||"")+'</span>'+
-        '<span class="et-id">EM-'+e.id+'</span>'+
+        '<span class="et-id">__PFX__-'+e.id+'</span>'+
         '<span class="et-name">'+esc(e.title)+'</span>'+
         '<span class="ebar" role="img" aria-label="'+e.closed+' closed, '+e.open+' open, '+e.wf+' won\'t-fix">'+
           '<span class="seg-done" style="width:'+pct(e.closed,t)+'%"></span>'+
           '<span class="seg-open" style="width:'+pct(e.open,t)+'%"></span>'+
           '<span class="seg-wf" style="width:'+pct(e.wf,t)+'%"></span></span>'+
-        '<span class="et-sub">'+(e.open?('<b>'+e.open+'</b> open'):'complete')+' · '+t+' total</span>'+
+        '<span class="et-sub">'+(t===0?'no tickets yet':
+            ((e.open?('<b>'+e.open+'</b> open'):'complete')+' · '+t+' total'))+'</span>'+
         '<span class="e-chip '+st.cls+'">'+st.txt+'</span></a>';
     }).join("")+'</div>';
   }
@@ -3346,13 +3376,13 @@ section.collapsed .sec-head{margin-bottom:0}
       var lis=items.map(function(it){return ticketRow(it,view,false);}).join("");
       if(!lis) lis='<li><a style="cursor:default"><span class="b-ttl" style="color:var(--ink-mut)">none in this view</span></a></li>';
       var det=document.createElement("details");
-      det.className="bcard"+(e.id==="E019"&&e.open>0?" hl":"");
+      det.className="bcard";
       det.open=(e.id in cardOpen)?cardOpen[e.id]:(filtering||items.length<=25);
       det.addEventListener("toggle",function(){cardOpen[e.id]=det.open;});
       det.innerHTML=
         '<summary><span class="b-caret">▶</span>'+
         '<span class="b-emo">'+(e.emoji||"")+'</span>'+
-        '<span class="b-head-main"><a class="b-head-id" href="/epic/'+e.id+'" title="open the epic page">EM-'+e.id+' ↗</a>'+
+        '<span class="b-head-main"><a class="b-head-id" href="/epic/'+e.id+'" title="open the epic page">__PFX__-'+e.id+' ↗</a>'+
         '<span class="b-head-name">'+esc(e.title)+'</span></span>'+
         '<span class="b-toggle" data-epic="'+e.id+'">'+
           '<button type="button" data-view="open" aria-pressed="'+(view==="open")+'">open '+(filtering?openF.length+"/"+e.open:e.open)+'</button>'+
@@ -3528,7 +3558,7 @@ section.collapsed .sec-head{margin-bottom:0}
     d.epics.forEach(function(e){
       var eid=e.id.toLowerCase();
       if(eid.indexOf(qe)===-1&&("em-"+eid).indexOf(q)===-1&&e.title.toLowerCase().indexOf(q)===-1)return;
-      var r={kind:"epic",href:"/epic/"+e.id,id:"EM-"+e.id,title:e.title,emo:e.emoji,
+      var r={kind:"epic",href:"/epic/"+e.id,id:"__PFX__-"+e.id,title:e.title,emo:e.emoji,
              sub:e.open+" open · "+e.closed+" closed"};
       (eid===qe?exact:rest).push(r);
     });
@@ -3546,7 +3576,7 @@ section.collapsed .sec-head{margin-bottom:0}
         (e[bk[0]]||[]).forEach(function(t){
           if(!matchQ(t,q))return;
           var r={kind:bk[1],href:"/ticket/"+encodeURIComponent(t.id),id:t.id,
-                 title:t.title,sub:(e.emoji?e.emoji+" ":"")+"EM-"+e.id};
+                 title:t.title,sub:(e.emoji?e.emoji+" ":"")+"__PFX__-"+e.id};
           (t.id.toLowerCase()===q||t.id.toLowerCase()==="em-"+qe?exact:rest).push(r);
         });
       });
@@ -3896,7 +3926,7 @@ def _flow_page(title, emoji, eyebrow, heading, controls, body, script, extra_css
     return (
         '<!doctype html><html><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        "<title>" + title + " &middot; Clean Paste</title>"
+        "<title>" + title + " &middot; __BRAND__</title>"
         "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'"
         " viewBox='0 0 100 100'><text y='.9em' font-size='90'>" + emoji + "</text></svg>\">"
         "<style>" + DASHBOARD_CSS + FLOW_CSS + extra_css + "</style></head>"
@@ -4550,7 +4580,7 @@ DEPS_SCRIPT = r"""
     var html='<option value="__all">— all epics ('+Object.keys(STATE.nodes).length+') —</option>';
     Object.keys(counts).sort().forEach(function(c){
       var e=epics[c]||{};
-      html+='<option value="'+F.esc(c)+'">'+F.esc((e.emoji||"🎟️")+"  EM-"+(c||"?")+" · "+
+      html+='<option value="'+F.esc(c)+'">'+F.esc((e.emoji||"__FAVICON__")+"  __PFX__-"+(c||"?")+" · "+
         (e.title||c||"unassigned")+"  ("+counts[c]+")")+'</option>';
     });
     document.getElementById("dgEpic").innerHTML=html;
@@ -4587,7 +4617,7 @@ DEPS_SCRIPT = r"""
     return '<div class="tt-head"><span class="tt-id">'+F.esc(nid)+'</span>'+
       '<span class="fc-badge '+cls(t.status)+'">'+F.esc(t.status)+'</span></div>'+
       '<div class="tt-ttl">'+F.esc(t.title||"(no title)")+'</div>'+
-      (ep?'<div class="tt-epic">'+(ep.emoji||"")+" EM-"+F.esc(ep.id)+" · "+F.esc(ep.title||"")+'</div>':"")+
+      (ep?'<div class="tt-epic">'+(ep.emoji||"")+" __PFX__-"+F.esc(ep.id)+" · "+F.esc(ep.title||"")+'</div>':"")+
       (pills?'<div class="tt-pills">'+pills+'</div>':"")+
       '<div class="tt-row"><span class="k">blocked by</span><b>'+(STATE.pars[nid]||[]).length+'</b></div>'+
       '<div class="tt-row"><span class="k">blocks</span><b>'+(STATE.kids[nid]||[]).length+'</b></div>'+
@@ -4602,7 +4632,7 @@ DEPS_SCRIPT = r"""
     card.innerHTML='<span class="fc-id">'+F.esc(id)+'</span>'+
       '<span class="fc-badge '+cls(t.status)+'">'+F.esc(t.status)+'</span>'+
       '<span class="fc-ttl">'+F.esc(t.title||"(no title)")+'</span>'+
-      (ep?'<a class="fc-epic" href="/epic/'+F.esc(ep.id)+'">'+(ep.emoji||"")+" EM-"+F.esc(ep.id)+'</a>':"")+
+      (ep?'<a class="fc-epic" href="/epic/'+F.esc(ep.id)+'">'+(ep.emoji||"")+" __PFX__-"+F.esc(ep.id)+'</a>':"")+
       (t.effort?'<span class="fc-epic">'+F.esc(t.effort)+'</span>':"")+
       '<a class="fc-epic" href="/ticket/'+encodeURIComponent(id)+'">open ticket ↗</a>';
   }
@@ -4768,7 +4798,7 @@ DEPS_SCRIPT = r"""
     var direct=(STATE.pars[id]||[]).filter(visible),dkids=(STATE.kids[id]||[]).filter(visible);
     var openBlockers=(STATE.pars[id]||[]).filter(function(p){return STATE.nodes[p].status==="OPEN";});
     F.tiles("tiles",[
-      {v:t.status,l:"Status",s:t.epic?("epic EM-"+t.epic):"—",
+      {v:t.status,l:"Status",s:t.epic?("epic __PFX__-"+t.epic):"—",
        cls:t.status==="OPEN"?"is-open":t.status==="CLOSED"?"is-done":"is-wf",
        href:"/ticket/"+encodeURIComponent(id)},
       {v:openBlockers.length,l:"Open blockers",s:openBlockers.length?"still in the way":"nothing in the way",
@@ -5263,6 +5293,7 @@ class Handler(BaseHTTPRequestHandler):
     def _activate_from_request(self):
         """Pick the interface for this request from the `ifc` cookie (default:
         the first registered)."""
+        refresh_registry()
         if len(INTERFACES) <= 1:
             activate(INTERFACES[0])
             return
@@ -5916,9 +5947,13 @@ def _list_tools(src, name):
 
 def _transform_html(s):
     """Reskin one HTML page for the active interface: theme colours + signature
-    strip, then brand, favicon, tagline, eyebrow, and id prefix. Each guard
-    skips work when the value still equals the built-in (blue/Clean Paste)
-    default, so a repo with no config pays nothing and looks unchanged."""
+    strip, then the identity tokens the templates carry (__PFX__, __BRAND__,
+    __FAVICON__, __TAGLINE__, __EYEBROW__).
+
+    Tokens — not real-looking search text — so a ticket body that happens to
+    mention another project's ids is never rewritten, and editing template
+    copy can't silently break the substitution. Always substituted: with no
+    config the engine defaults ("TK", "Tickets", ...) render."""
     if THEME_REMAP:
         for a, b in THEME_REMAP.items():
             s = s.replace(a, b)
@@ -5927,16 +5962,11 @@ def _transform_html(s):
                  "background:linear-gradient(90deg,%s)}" % ",".join(THEME_STRIP))
         s = s.replace("*{box-sizing:border-box}",
                       strip + "*{box-sizing:border-box}", 1)
-    if PFX != "EM":
-        s = s.replace("EM-", PFX + "-")
-    if BRAND != "Clean Paste":
-        s = s.replace("Clean Paste", BRAND)
-    if FAVICON != "🎟️":
-        s = s.replace("🎟️", FAVICON)
-    if TAGLINE != "The PII-firewall build tracked as":
-        s = s.replace("The PII-firewall build tracked as", TAGLINE)
-    if EYEBROW != "Ticket portfolio &middot; engineering program":
-        s = s.replace("Ticket portfolio &middot; engineering program", EYEBROW)
+    s = (s.replace("__PFX__", PFX)
+          .replace("__BRAND__", BRAND)
+          .replace("__FAVICON__", FAVICON)
+          .replace("__TAGLINE__", TAGLINE)
+          .replace("__EYEBROW__", EYEBROW))
     # Dashboard-only tokens (no-ops on every other page). Always substituted so
     # the standard title mark renders even with no config file.
     if "__HDR_ICON__" in s:
@@ -6016,7 +6046,7 @@ def apply_config(conf):
     _MD_EPIC_FILE_RE = _IDRE["md_epic"]
     _MD_TICKET_FILE_RE = _IDRE["md_ticket"]
 
-    epics = conf.get("epics", {})
+    epics = {_epic_key(k): v for k, v in conf.get("epics", {}).items()}
     if epics:
         EPIC_TITLES = {k: (v.get("title", k) if isinstance(v, dict) else v)
                        for k, v in epics.items()}
@@ -6037,17 +6067,78 @@ def apply_config(conf):
 # user dashboard — requests are effectively serial anyway).
 # --------------------------------------------------------------------------- #
 class Interface:
-    __slots__ = ("slug", "name", "icon", "root", "conf", "shortcut")
+    __slots__ = ("slug", "name", "icon", "root", "conf", "shortcut", "_mtime")
 
     def __init__(self, slug, name, icon, root, conf, shortcut=""):
         self.slug, self.name, self.icon, self.root, self.conf = slug, name, icon, root, conf
         self.shortcut = shortcut
+        self._mtime = self._conf_mtime()
+
+    def _conf_mtime(self):
+        try:
+            return os.path.getmtime(os.path.join(self.root, CONFIG_REL))
+        except OSError:
+            return 0.0
+
+    def refresh(self):
+        """Re-read config.json if it changed on disk. Tickets are re-scanned on
+        every request, so a config that only took effect on restart was the odd
+        one out — and silently served stale values after an edit."""
+        mt = self._conf_mtime()
+        if mt != self._mtime:
+            self._mtime = mt
+            self.conf = load_config(self.root) or {}
 
 
 INTERFACES = []                  # ordered list (CLI order == switcher order)
 _IFACE_BY_SLUG = {}
 ACTIVE_SLUG = ""
 _LOCK = threading.Lock()
+
+REGISTRY_FILE = None             # hub only: watched so init/register show up live
+_REGISTRY_MTIME = 0.0
+
+
+def _load_registry_roots(path):
+    """The hub registry: {"repos": [roots]} (a bare list is tolerated)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    repos = data if isinstance(data, list) else (data or {}).get("repos", [])
+    return [r for r in repos if isinstance(r, str)]
+
+
+def refresh_registry():
+    """Follow live registry edits (`interfacile init` / `register` /
+    `unregister`) without a hub restart. Runs per request under the request
+    lock; when nothing changed it costs one mtime probe."""
+    global _REGISTRY_MTIME
+    if not REGISTRY_FILE:
+        return
+    try:
+        mt = os.path.getmtime(REGISTRY_FILE)
+    except OSError:
+        return
+    if mt == _REGISTRY_MTIME:
+        return
+    _REGISTRY_MTIME = mt
+    roots = _load_registry_roots(REGISTRY_FILE)
+    if roots is None:
+        return
+    keep = [os.path.abspath(r) for r in roots
+            if os.path.isdir(os.path.join(os.path.abspath(r), "tickets"))]
+    current = [it.root for it in INTERFACES]
+    # Never let a bad edit empty a running hub; ignore no-op rewrites.
+    if not keep or keep == current:
+        return
+    for root in keep:
+        if root not in current:
+            migrate_state(root)
+    build_registry(keep)
+    print("hub: registry changed — serving %d interface(s): %s"
+          % (len(INTERFACES), ", ".join(it.slug for it in INTERFACES)), flush=True)
 
 
 def _slugify(base, seen):
@@ -6086,6 +6177,7 @@ def activate(iface):
     PINS_FILE, NOTE_FILES = _state_paths(REPO_ROOT)
     LEGACY_PINS_FILE, LEGACY_NOTE_FILES = _legacy_state_paths(REPO_ROOT)
     ACTIVE_SLUG = iface.slug
+    iface.refresh()
     apply_config(iface.conf)
 
 
@@ -6539,9 +6631,19 @@ def _switcher_html(is_dash=True):
 _BODY_OPEN_RE = re.compile(r"(<body[^>]*>)", re.I)
 
 
-def run(repo_roots, port=None, host="127.0.0.1", open_browser=True):
+def run(repo_roots, port=None, host="127.0.0.1", open_browser=True,
+        registry_file=None):
     """Serve one or more repos from a single process. >1 repo shows the switcher.
-    This is the heart the CLI (`interfacile serve` / `interfacile hub`) drives."""
+    This is the heart the CLI (`interfacile serve` / `interfacile hub`) drives.
+    When the hub was launched from the registry (rather than explicit --repo
+    flags), pass `registry_file` and later registrations show up live."""
+    global REGISTRY_FILE, _REGISTRY_MTIME
+    REGISTRY_FILE = registry_file
+    if registry_file:
+        try:
+            _REGISTRY_MTIME = os.path.getmtime(registry_file)
+        except OSError:
+            _REGISTRY_MTIME = 0.0
     build_registry(repo_roots)
     for it in INTERFACES:
         if not os.path.isdir(os.path.join(it.root, "tickets")):
@@ -6583,7 +6685,7 @@ def run(repo_roots, port=None, host="127.0.0.1", open_browser=True):
 
 
 def main(argv=None):
-    """Backward-compatible flat CLI, used by the scripts/dev shim."""
+    """Flat CLI for `python -m interfacile.server`; the real UX is interfacile.cli."""
     ap = argparse.ArgumentParser(description="interfacile — ticket-portfolio dashboard.")
     ap.add_argument("--port", type=int, default=None,
                     help="listen port (overrides .interfacile/config.json; default 8787)")

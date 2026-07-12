@@ -1,0 +1,22 @@
+---
+name: close-ticket
+description: Close a finished ticket properly. Use when the user says "close <ticket id>" or when work on a ticket is verified complete. Verifies acceptance criteria, then uses `interfacile close` so status, dates, and file location stay consistent.
+---
+
+# Close a ticket
+
+1. **Verify first.** `interfacile show <ID>` — every acceptance criterion must
+   be checked (`- [x]`). If some are not, either finish them or say why not.
+   A ticket that is intentionally being dropped gets `status: WONT_FIX`
+   (edited by hand, with a line in the body saying why), not CLOSED.
+2. **Close.**
+
+       interfacile close <ID> --note "one line on what shipped"
+
+   This sets `status: CLOSED`, stamps `closed:` and `updated:`, and moves the
+   file to the epic's `closed/` folder. Never do those steps by hand.
+3. **Check the fallout.** `interfacile lint` must pass. The close command
+   prints anything that just became unblocked — mention it to the user as the
+   natural next thing to pick up.
+4. **Commit** with the ticket id leading the message:
+   `{{PREFIX}}-0012: what shipped`.
