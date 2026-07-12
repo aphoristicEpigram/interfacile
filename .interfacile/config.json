@@ -71,7 +71,6 @@
       "accent": "#ff5fb0"
     }
   },
-  "shortcut": "3",
   "server": {
     "port": 8790
   }

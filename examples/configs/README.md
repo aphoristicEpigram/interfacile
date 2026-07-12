@@ -19,7 +19,7 @@ Two ready-made examples in this folder — copy either into your repo as
 
 | File | Shows |
 |---|---|
-| [`starter.interfacile.json`](starter.interfacile.json) | the minimal useful config: brand, prefix, a preset theme, a shortcut |
+| [`starter.interfacile.json`](starter.interfacile.json) | the minimal useful config: brand, prefix, a preset theme |
 | [`custom-theme.interfacile.json`](custom-theme.interfacile.json) | everything: named epics, header links, a full custom palette |
 
 ## Fields
@@ -137,15 +137,40 @@ to keep the default order and full set. (Exact panel keys are finalised when the
 reorder feature lands; the two examples omit this and so render the standard
 layout.)
 
-### `shortcut` (optional)
-A single key that switches to this interface from anywhere in the hub — press it
-(e.g. `"1"`) and the board flips, no mouse needed. It's shown as a keycap in the
-switcher menu, and ignored while you're typing in a field. Give each interface a
-distinct key (digits are safest).
+### `documents` (optional)
+Document *series* — numbered docs the system picks up wherever it sees them,
+exactly like the built-in ADR series (`ADR-###` under
+`docs/architecture/adr/`). Declare a prefix and a folder:
 
 ```json
-"shortcut": "1"
+"documents": [
+  { "prefix": "PR",  "dir": "docs/product", "title": "Product requirements" },
+  { "prefix": "RFC", "dir": "docs/rfcs" }
+]
 ```
+
+Each series gets the full ADR treatment:
+
+- **Mentions link.** `PR-001` anywhere in a rendered ticket or doc links to
+  the matching `PR-001*.md` under `dir` (searched recursively, live — a new
+  file links on the next refresh).
+- **An index page** at `/docs/PR` (`/adrs` is the ADR one), newest first,
+  with each doc's title, `**Status:**`, and `**Date:**` parsed from its head
+  — plus a header button on the dashboard.
+- **The jump box** finds them by number or title, next to tickets and epics.
+
+A number that matches no file stays plain text (links never 404); a number
+shared by two files links to the index so the reader can choose. `title` is
+optional (used on the index page). A rule whose prefix equals your ticket
+prefix or `ADR` is ignored — those are already picked up.
+
+### Switcher keys (not configured here)
+
+Hub shortcut keys are **positional**: the first ten interfaces in switcher
+order answer to `1`–`9` then `0` — press the key anywhere in the hub and the
+board flips, no mouse needed (ignored while you're typing in a field). Change
+a repo's key by changing its position: drag it in the switcher menu, or run
+`interfacile shortcut N`. A `"shortcut"` field in this file is no longer read.
 
 ### `server` (optional)
 | Key | Meaning |

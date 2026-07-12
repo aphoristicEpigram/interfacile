@@ -62,6 +62,7 @@ THEME_REMAP = {}                 # canonical(blue)->theme hex map; {} == blue
 THEME_STRIP = None               # signature-strip colours, or None
 THEME_OVERRIDE_CSS = ""          # custom-palette :root override, or ""
 LINKS = []                       # per-project quick links: list of {emoji,title,url}
+DOC_RULES = []                   # doc-link rules: list of {prefix,dir} from config
 
 # Frozen copies of the built-in defaults. apply_config() falls back to *these*
 # for any missing key, so switching interfaces resets cleanly instead of
@@ -261,39 +262,64 @@ def _git_info():
 
 
 ADR_DIR = os.path.join(REPO_ROOT, "docs", "architecture", "adr")
-ADR_FILE_RE = re.compile(r"^ADR-(\d+)")
 ADR_LINK_RE = re.compile(r"\bADR-(\d{1,4})\b")
 
 
-def adr_index():
-    """All ADR files plus per-number link targets.
+def series_index(prefix, dirpath, kind=None):
+    """All docs of one reserved series (ADR-*, PR-*, RFC-*, …) plus
+    per-number link targets.
 
-    Returns (records, by_num). records is every ADR-*.md, newest number
-    first. by_num maps int number -> /doc path when the number is
-    unambiguous, or "" when several files share it (numbering collision:
-    bare-text mentions of those link to /adrs so the reader can choose)."""
+    Returns (records, by_num). records is every <prefix>-*.md under dirpath
+    (recursive), newest number first, with title / **Status:** / **Date:**
+    parsed from the head of each file. by_num maps int number -> /doc path
+    when the number is unambiguous, or "" when several files share it
+    (numbering collision: bare-text mentions link to the series index so the
+    reader can choose)."""
     recs = []
-    for path in sorted(glob.glob(os.path.join(ADR_DIR, "ADR-*.md"))):
-        m = ADR_FILE_RE.match(os.path.basename(path))
+    file_re = re.compile(r"^%s-(\d+)" % re.escape(prefix))
+    pattern = os.path.join(dirpath, "**", prefix + "-*.md")
+    for path in sorted(glob.glob(pattern, recursive=True)):
+        m = file_re.match(os.path.basename(path))
         if not m:
             continue
         head = read_text(path)[:1500]
-        tm = re.search(r"^#\s+ADR-\d+\s*[:—–-]*\s*(.*)$", head, re.M)
+        tm = re.search(r"^#\s+%s-\d+\s*[:—–-]*\s*(.*)$" % re.escape(prefix),
+                       head, re.M)
         sm = re.search(r"\*\*Status:\*\*\s*([A-Za-z][\w /-]*)", head)
         dm = re.search(r"\*\*Date:\*\*\s*(\d{4}-\d{2}-\d{2})", head)
         recs.append({
             "n": int(m.group(1)),
-            "num": "ADR-" + m.group(1),
+            "num": prefix + "-" + m.group(1),
+            "kind": kind or prefix.lower(),
             "title": (tm.group(1).strip() if tm else os.path.basename(path)),
             "status": (sm.group(1).strip() if sm else ""),
             "date": dm.group(1) if dm else "",
-            "path": os.path.relpath(path, REPO_ROOT),
+            "path": os.path.relpath(path, REPO_ROOT).replace(os.sep, "/"),
         })
     recs.sort(key=lambda r: (-r["n"], r["path"]))
     by_num = {}
     for r in recs:
         by_num[r["n"]] = "" if r["n"] in by_num else r["path"]
     return recs, by_num
+
+
+def adr_index():
+    """The built-in series: architecture decision records."""
+    return series_index("ADR", ADR_DIR, kind="adr")
+
+
+def doc_series():
+    """Every document series the active interface knows about: the built-in
+    ADR series plus the config's `documents` rules. Declaring a prefix (PR,
+    RFC, …) just means the system picks its numbered docs up — the full ADR
+    treatment: autolinked mentions, an index page, the dashboard jump box."""
+    out = [{"prefix": "ADR", "dir": os.path.relpath(ADR_DIR, REPO_ROOT),
+            "title": "Architecture decision records", "href": "/adrs"}]
+    for rule in DOC_RULES:
+        out.append({"prefix": rule["prefix"], "dir": rule["dir"],
+                    "title": rule.get("title") or rule["prefix"] + " documents",
+                    "href": "/docs/" + rule["prefix"]})
+    return out
 
 
 # Per-repo runtime state (pins, scratchpad, to-do) lives in a single hidden
@@ -730,6 +756,21 @@ def scan():
         "compare": compare,
     }
 
+    # Doc pins: a pin key containing a slash is a repo-relative markdown path,
+    # so any doc (ADR, blog draft, spec) can sit in the pinned panel too.
+    for key, stamp in pins.items():
+        if "/" not in key:
+            continue
+        full = os.path.realpath(os.path.join(REPO_ROOT, key))
+        if not (full.startswith(os.path.realpath(REPO_ROOT) + os.sep)
+                and full.endswith(".md") and os.path.isfile(full)):
+            continue
+        tm = re.search(r"^#\s+(.*)$", read_text(full)[:2000], re.M)
+        name = os.path.basename(key)[:-3]
+        pinned_list.append((str(stamp), {
+            "id": name, "title": (tm.group(1).strip() if tm else name),
+            "status": "DOC", "doc": key, "slug": name}))
+
     return {
         "generated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": os.path.relpath(TICKETS_DIR, REPO_ROOT),
@@ -753,7 +794,11 @@ def scan():
                             last_worked["mtime"]).isoformat()}
                        if last_worked["mtime"] else None),
         "git": _git_info(),
-        "adrs": adr_index()[0],
+        # Every document series' records (ADRs plus configured ones) — the
+        # key predates the generic series and the dashboard JS reads it.
+        "adrs": [r for s in doc_series()
+                 for r in series_index(s["prefix"],
+                                       os.path.join(REPO_ROOT, s["dir"]))[0]],
         "epics": sorted(epics.values(), key=lambda e: e["id"]),
     }, id_index
 
@@ -872,9 +917,29 @@ EPIC_LINK_RE = _IDRE["epic_link"]
 _SKIP_SEGMENT_RE = re.compile(r"(<a\b.*?</a>|<pre>.*?</pre>)", re.S)
 
 
+def doc_rule_index():
+    """{prefix: {number: /doc path or "" on numbering collision}} for every
+    configured document rule — the generic cousin of adr_index(). Scans live,
+    like everything else, so a new PR-002.md links on the next request."""
+    out = {}
+    for rule in DOC_RULES:
+        by_num = {}
+        pattern = os.path.join(REPO_ROOT, rule["dir"], "**",
+                               rule["prefix"] + "-*.md")
+        for path in sorted(glob.glob(pattern, recursive=True)):
+            m = re.match(r"^%s-(\d+)\b" % rule["prefix"], os.path.basename(path))
+            if not m:
+                continue
+            n = int(m.group(1))
+            rel = os.path.relpath(path, REPO_ROOT).replace(os.sep, "/")
+            by_num[n] = "" if n in by_num else rel
+        out[rule["prefix"]] = by_num
+    return out
+
+
 def autolink_ids(html_text, known_ids=None, known_epics=None, adrs=None):
-    """Hyperlink EM-#### ticket ids, EM-E### epic codes, and ADR-### numbers
-    in rendered HTML.
+    """Hyperlink ticket ids, epic codes, ADR-### numbers, and any configured
+    document rules (PR-###, RFC-### …) in rendered HTML.
 
     Skips existing anchors and <pre> blocks. When known sets are supplied,
     only ids that resolve to a real page are linked, so links never 404."""
@@ -898,6 +963,16 @@ def autolink_ids(html_text, known_ids=None, known_epics=None, adrs=None):
             return '<a href="/adrs">%s</a>' % m.group(0)
         return '<a href="/doc/%s">%s</a>' % (target, m.group(0))
 
+    rules = doc_rule_index() if DOC_RULES else {}
+
+    def _sub_doc(m, pfx, by_num):
+        target = by_num.get(int(m.group(1)))
+        if target is None:   # unknown number: leave as plain text
+            return m.group(0)
+        if target == "":     # number shared by several files — send to the index
+            return '<a href="/docs/%s">%s</a>' % (pfx, m.group(0))
+        return '<a href="/doc/%s">%s</a>' % (target, m.group(0))
+
     out = []
     for part in _SKIP_SEGMENT_RE.split(html_text):
         if part.startswith("<a") or part.startswith("<pre"):
@@ -906,6 +981,9 @@ def autolink_ids(html_text, known_ids=None, known_epics=None, adrs=None):
             part = EPIC_LINK_RE.sub(_sub_epic, part)
             if adrs:
                 part = ADR_LINK_RE.sub(_sub_adr, part)
+            for pfx, by_num in rules.items():
+                part = re.sub(r"\b%s-(\d+)\b" % pfx,
+                              lambda m, p=pfx, b=by_num: _sub_doc(m, p, b), part)
             out.append(TICKET_LINK_RE.sub(_sub_ticket, part))
     return "".join(out)
 
@@ -1282,7 +1360,25 @@ def render_ticket_page(path, known_ids=None, known_epics=None, adrs=None,
     return page
 
 
-def render_doc_page(path, known_ids=None, known_epics=None, adrs=None):
+_DOC_PIN_SCRIPT = """<script>(function(){
+  var b=document.getElementById('pinBtn');if(!b)return;
+  function set(p){b.classList.toggle('pinned',p);b.setAttribute('data-pinned',p?'1':'0');
+    b.innerHTML=p?'\\uD83D\\uDD16 Pinned':'\\uD83D\\uDD16 Pin';
+    b.title=p?'Pinned to the dashboard \\u2014 click to unpin':'Pin this doc to the dashboard';}
+  set(b.getAttribute('data-pinned')==='1');
+  b.addEventListener('click',function(){
+    var want=b.getAttribute('data-pinned')!=='1';b.disabled=true;
+    fetch('/api/pin',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:b.getAttribute('data-doc'),pinned:want})})
+      .then(function(r){return r.json();})
+      .then(function(res){if(res.ok)set(res.pinned);})
+      .finally(function(){b.disabled=false;});
+  });
+})();</script>"""
+
+
+def render_doc_page(path, known_ids=None, known_epics=None, adrs=None,
+                    pinned=False):
     """Rendered view of any markdown file in the repo (ADRs, epic charters…)."""
     text = read_text(path)
     fm_lines, body = split_frontmatter(text)
@@ -1308,7 +1404,9 @@ def render_doc_page(path, known_ids=None, known_epics=None, adrs=None):
         rewrite_md_links(md_to_html(body), os.path.dirname(path),
                          known_ids, known_epics),
         known_ids, known_epics, adrs)
-    rel = html.escape(os.path.relpath(path, REPO_ROOT))
+    # Pin keys always use forward slashes so they're portable across platforms.
+    rel_key = os.path.relpath(path, REPO_ROOT).replace(os.sep, "/")
+    rel = html.escape(rel_key)
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -1319,15 +1417,19 @@ def render_doc_page(path, known_ids=None, known_epics=None, adrs=None):
         "<a class='back' href='/'>&larr; back to dashboard</a>"
         "<div class='tid'>" + rel + "</div>"
         "<h1 class='title'>" + html.escape(title) + "</h1>"
+        "<div class='tbar'><button class='tb pin' id='pinBtn' type='button' "
+        "data-pinned='" + ("1" if pinned else "0") + "' data-doc='"
+        + html.escape(rel_key, quote=True) + "'>&#128278;</button></div>"
         + fm_html +
         "<div class='body'>" + body_html + "</div>"
         "<div class='path'>" + rel + "</div>"
-        "</div></body></html>"
+        "</div>" + _DOC_PIN_SCRIPT + "</body></html>"
     )
 
 
-def render_adr_page(recs, by_num):
-    """Index of every architecture decision record, newest first."""
+def render_series_page(series, recs, by_num):
+    """Index of one reserved document series (ADRs, PRs, RFCs…), newest first."""
+    plural = series["prefix"] + "s"
     lis = ""
     for a in recs:
         s = a["status"].lower()
@@ -1351,20 +1453,21 @@ def render_adr_page(recs, by_num):
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>ADRs &middot; __BRAND__</title>"
+        "<title>" + html.escape(plural) + " &middot; __BRAND__</title>"
         "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'"
         " viewBox='0 0 100 100'><text y='.9em' font-size='90'>__FAVICON__</text></svg>\">"
         "<style>" + EPIC_CSS + "</style></head><body><div class='wrap'>"
         "<a class='back' href='/'>&larr; back to dashboard</a>"
         "<div class='ehead'>"
-        "<div class='tid'>ARCHITECTURE DECISION RECORDS</div>"
-        "<h1 class='title'>ADRs</h1>"
+        "<div class='tid'>" + html.escape(series["title"].upper()) + "</div>"
+        "<h1 class='title'>" + html.escape(plural) + "</h1>"
         "<div class='estats'><span><b>" + str(len(recs)) + "</b> records</span>"
-        "<span>docs/architecture/adr/</span></div></div>"
+        "<span>" + html.escape(series["dir"]) + "/</span></div></div>"
         "<div class='cols' style='grid-template-columns:1fr'>"
         "<div class='col'><div class='col-h'><span>Newest first</span>"
         "<span class='cnt'>" + str(len(recs)) + "</span></div>"
-        "<ul>" + (lis or '<div class="empty">no ADRs found</div>') + "</ul></div>"
+        "<ul>" + (lis or '<div class="empty">no ' + html.escape(plural)
+                  + ' found</div>') + "</ul></div>"
         "</div></div></body></html>"
     )
 
@@ -1831,7 +1934,7 @@ def render_filter_page(data, q):
 
     Query params (all optional): status=open,closed,wf · risk · priority ·
     quick=1 · blocked=y|n · stale=<days> · closed_from/closed_to ·
-    created_from/created_to · label=<heading>."""
+    created_from/created_to · created=today · closed=today · label=<heading>."""
     today = datetime.date.today()
 
     def qv(key, default=""):
@@ -1847,6 +1950,11 @@ def render_filter_page(data, q):
     stale = int(qv("stale")) if qv("stale").isdigit() else None
     c_from, c_to = parse_date(qv("closed_from")), parse_date(qv("closed_to"))
     n_from, n_to = parse_date(qv("created_from")), parse_date(qv("created_to"))
+    # Shorthands for static links (the KPI tiles): the server knows the date.
+    if qv("created") == "today":
+        n_from = n_to = today
+    if qv("closed") == "today":
+        c_from = c_to = today
     label = qv("label") or "Filtered tickets"
 
     def keep(st, t):
@@ -2373,6 +2481,7 @@ text-decoration:none;color:inherit;border-bottom:1px solid var(--line-2)}
 color:var(--ink-mut);flex:none;min-width:46px}
 .lw .b-ttl{flex:1;min-width:0}
 .g-kind.k-adr{background:var(--warn);color:#fff}
+.g-kind.k-doc{background:var(--surface-2);color:var(--ink-mut);border:1px solid var(--line)}
 .dg-wrap{position:relative;overflow-x:auto;border:1px solid var(--line);border-radius:9px;
 background:var(--surface);box-shadow:var(--shadow);padding:6px}
 .dg-edge{fill:none;stroke:var(--line);stroke-width:1.5;transition:opacity .12s,stroke .12s}
@@ -2450,7 +2559,7 @@ section.collapsed .sec-head{margin-bottom:0}
         <a class="hbtn" href="#sec-prioritize">&darr; Prioritize</a>
         <a class="hbtn" href="#sec-backlog">&darr; Backlog</a>
         <a class="hbtn" href="#sec-epics">&darr; Epics</a>
-        <a class="hbtn" href="/adrs">ADRs &nearr;</a>
+        __DOC_SERIES__
       </span>
     </div>
     <div class="meter-block">
@@ -2482,6 +2591,8 @@ section.collapsed .sec-head{margin-bottom:0}
     <a href="#sec-epics"><b>07</b>Epics</a>
   </nav>
   <div class="kpis">
+    <div class="kpi is-open clickable" data-href="/filter?created=today&label=Created%20today" title="Tickets created today. Click for the list."><span class="k-val" id="k-newtoday">&mdash;</span><span class="k-lab">Created today</span><span class="k-sub" id="k-newtoday-sub">&nbsp;</span></div>
+    <div class="kpi is-done clickable" data-href="/filter?closed=today&status=closed&label=Closed%20today" title="Tickets closed today. Click for the list."><span class="k-val" id="k-donetoday">&mdash;</span><span class="k-lab">Closed today</span><span class="k-sub" id="k-donetoday-sub">&nbsp;</span></div>
     <div class="kpi clickable" data-href="/filter?label=All%20tickets" title="Click for the full ticket list"><span class="k-val" id="k-total">&mdash;</span><span class="k-lab">Tickets tracked</span><span class="k-sub" id="k-total-sub">&nbsp;</span></div>
     <div class="kpi is-done clickable" data-href="/filter?status=closed&label=Closed%20and%20shipped" title="Click for all closed tickets"><span class="k-val" id="k-closed">&mdash;</span><span class="k-lab">Closed &amp; shipped</span><span class="k-sub" id="k-closed-sub">&nbsp;</span></div>
     <div class="kpi is-open clickable" data-href="/filter?status=open&label=Open%20tickets" title="Click for all open tickets"><span class="k-val" id="k-open">&mdash;</span><span class="k-lab">Open</span><span class="k-sub" id="k-open-sub">&nbsp;</span></div>
@@ -2779,16 +2890,18 @@ section.collapsed .sec-head{margin-bottom:0}
     var d=STATE.data,strip=document.getElementById("topstrip");
     var pins=d.pinned||[],wip=d.wip||[];
     function row(it,extra){
-      return '<a href="/ticket/'+encodeURIComponent(it.id)+'"'+dataAttrs(it)+'>'+
-        statusChipHtml(it.status)+
+      /* doc pins link to their /doc/ page and skip the ticket-only badges */
+      var href=it.doc?'/doc/'+encodeURI(it.doc):'/ticket/'+encodeURIComponent(it.id);
+      return '<a href="'+href+'"'+(it.doc?'':dataAttrs(it))+'>'+
+        (it.doc?'<span class="g-kind k-doc">doc</span>':statusChipHtml(it.status))+
         '<span class="b-tid">'+esc(it.id)+'</span>'+
         '<span class="b-ttl">'+esc(it.title)+'</span>'+
-        '<span class="b-right">'+metaBadges(it,true)+extra+'</span></a>';
+        '<span class="b-right">'+(it.doc?'':metaBadges(it,true))+extra+'</span></a>';
     }
     document.getElementById("pinnedList").innerHTML=pins.map(function(it){
-      return row(it,'<button type="button" class="pin-x" data-id="'+esc(it.id)+
+      return row(it,'<button type="button" class="pin-x" data-id="'+esc(it.doc||it.id)+
         '" title="unpin '+esc(it.id)+'">✕ unpin</button>');
-    }).join("")||'<div class="chart-empty">Nothing pinned — use the 🔖 button at the top of any ticket page.</div>';
+    }).join("")||'<div class="chart-empty">Nothing pinned — use the 🔖 button at the top of any ticket or doc page.</div>';
     var wPanel=document.getElementById("wipPanel");
     var shown=wip.slice(0,8),more=wip.length-shown.length;
     document.getElementById("wipList").innerHTML=shown.map(function(it){
@@ -3182,6 +3295,23 @@ section.collapsed .sec-head{margin-bottom:0}
     var finishing=d.epics.filter(function(e){return e.open===1;}).length;
     document.getElementById("k-complete").textContent=complete;
     document.getElementById("k-complete-sub").textContent=finishing+" more at 1 open";
+    /* today's momentum: counts by exact created/closed date, local time */
+    function isoDay(dt){return dt.getFullYear()+"-"+("0"+(dt.getMonth()+1)).slice(-2)+"-"+("0"+dt.getDate()).slice(-2);}
+    var now=new Date(),todayI=isoDay(now),
+        weekI=isoDay(new Date(now.getTime()-6*864e5)),
+        newToday=0,doneToday=0,newWeek=0,doneWeek=0;
+    d.epics.forEach(function(e){
+      [].concat(e.openTickets||[],e.closedTickets||[],e.wfTickets||[],e.standingTickets||[])
+        .forEach(function(x){
+          if(x.created===todayI)newToday++;
+          if(x.created&&x.created>=weekI)newWeek++;
+          if(x.closed===todayI)doneToday++;
+          if(x.closed&&x.closed>=weekI)doneWeek++;});
+    });
+    document.getElementById("k-newtoday").textContent=newToday;
+    document.getElementById("k-newtoday-sub").textContent=newWeek+" in last 7d";
+    document.getElementById("k-donetoday").textContent=doneToday;
+    document.getElementById("k-donetoday-sub").textContent=doneWeek+" in last 7d";
   }
   function renderTracks(d){
     var complete=d.epics.filter(function(e){return e.open===0&&epTotal(e)>0;});
@@ -3565,7 +3695,9 @@ section.collapsed .sec-head{margin-bottom:0}
     (d.adrs||[]).forEach(function(a){
       var idl=a.num.toLowerCase();
       if(idl.indexOf(q)===-1&&a.title.toLowerCase().indexOf(q)===-1)return;
-      var r={kind:"adr",href:"/doc/"+encodeURI(a.path),id:a.num,title:a.title,
+      var k=a.kind||"adr";
+      var r={kind:k,cls:k==="adr"?"adr":"doc",
+             href:"/doc/"+encodeURI(a.path),id:a.num,title:a.title,
              sub:a.status||""};
       (idl===q?exact:rest).push(r);
     });
@@ -3586,7 +3718,7 @@ section.collapsed .sec-head{margin-bottom:0}
   function gRender(){
     var rows=gRes.slice(0,G_MAX).map(function(r,i){
       return '<a href="'+r.href+'"'+(i===gAct?' class="active"':'')+'>'+
-        '<span class="g-kind k-'+r.kind+'">'+r.kind+'</span>'+
+        '<span class="g-kind k-'+(r.cls||r.kind)+'">'+r.kind+'</span>'+
         (r.emo?'<span class="g-emo">'+r.emo+'</span>':'')+
         '<span class="g-id">'+esc(r.id)+'</span><span class="g-ttl">'+esc(r.title)+'</span>'+
         '<span class="g-sub">'+esc(r.sub||"")+'</span></a>';
@@ -5284,9 +5416,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _redirect(self, location):
+    def _redirect(self, location, cookie=None):
         self.send_response(302)
         self.send_header("Location", location)
+        if cookie:
+            self.send_header("Set-Cookie", cookie + "; Path=/; Max-Age=31536000")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -5352,6 +5486,14 @@ class Handler(BaseHTTPRequestHandler):
             data, id_index = scan()
             target = id_index.get(tid)
             if not target:
+                # Id prefixes are unique across a hub, so a ticket URL should
+                # work whichever interface happens to be active: hand the
+                # request to the interface that owns the prefix.
+                owner = _owner_interface(tid)
+                if owner:
+                    self._redirect(self.path,
+                                   cookie="ifc=" + urllib.parse.quote(owner.slug))
+                    return
                 self._send("<h1>404</h1><p>No ticket " + html.escape(tid) + "</p>", code=404)
                 return
             self._send(render_ticket_page(target, set(id_index),
@@ -5363,7 +5505,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path in ("/adrs", "/adrs/", "/adr"):
             recs, by_num = adr_index()
-            self._send(render_adr_page(recs, by_num))
+            self._send(render_series_page(doc_series()[0], recs, by_num))
+            return
+        if path.startswith("/docs/"):
+            # Index page for any document series (the generic /adrs).
+            want = path[len("/docs/"):].strip("/").upper()
+            for series in doc_series():
+                if series["prefix"] == want:
+                    recs, by_num = series_index(
+                        series["prefix"],
+                        os.path.join(REPO_ROOT, series["dir"]))
+                    self._send(render_series_page(series, recs, by_num))
+                    return
+            self._send("<h1>404</h1><p>No document series "
+                       + html.escape(want) + "</p>", code=404)
             return
         if path == "/filter":
             import urllib.parse
@@ -5394,9 +5549,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send("<h1>404</h1><p>No doc " + html.escape(rel) + "</p>", code=404)
                 return
             data, id_index = scan()
+            rel_key = os.path.relpath(full, REPO_ROOT).replace(os.sep, "/")
             self._send(render_doc_page(full, set(id_index),
                                        {e["id"] for e in data["epics"]},
-                                       adr_index()[1]))
+                                       adr_index()[1],
+                                       pinned=rel_key in load_pins()))
             return
         if path.endswith(".md"):
             # Stray raw-markdown URL (old bookmark or a relative link that
@@ -5436,6 +5593,35 @@ class Handler(BaseHTTPRequestHandler):
             self._do_post()
 
     def _do_post(self):
+        if self.path == "/api/ifc-order":
+            # Drag-reorder in the hub switcher. Only registry-driven hubs can
+            # persist an order; --repo hubs are pinned to their flag order.
+            if not REGISTRY_FILE:
+                self._send(json.dumps({"ok": False, "error": "order is fixed "
+                           "by --repo flags"}), "application/json; charset=utf-8",
+                           code=400)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                slugs = json.loads(self.rfile.read(length).decode("utf-8"))["slugs"]
+                by_slug = {it.slug: it for it in INTERFACES}
+                if sorted(slugs) != sorted(by_slug):
+                    raise ValueError("slugs don't match the serving interfaces")
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": "bad request: " + str(exc)}),
+                           "application/json; charset=utf-8", code=400)
+                return
+            ordered = [by_slug[s].root for s in slugs]
+            save_registry_order(REGISTRY_FILE, ordered)
+            global _REGISTRY_MTIME
+            try:
+                _REGISTRY_MTIME = os.path.getmtime(REGISTRY_FILE)
+            except OSError:
+                pass
+            build_registry(ordered)
+            self._send(json.dumps({"ok": True, "order": slugs}),
+                       "application/json; charset=utf-8")
+            return
         if self.path == "/api/pin":
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -5446,11 +5632,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(json.dumps({"ok": False, "error": "bad request: " + str(exc)}),
                            "application/json; charset=utf-8", code=400)
                 return
-            _, id_index = scan()
-            if tid not in id_index:
-                self._send(json.dumps({"ok": False, "error": "unknown ticket " + tid}),
-                           "application/json; charset=utf-8", code=404)
-                return
+            # A slash means a repo-relative doc path — any markdown file can be
+            # pinned, not just tickets. Bare ids must be real tickets.
+            if "/" in tid:
+                full = os.path.realpath(os.path.join(REPO_ROOT, tid))
+                if not (full.startswith(os.path.realpath(REPO_ROOT) + os.sep)
+                        and full.endswith(".md") and os.path.isfile(full)):
+                    self._send(json.dumps({"ok": False, "error": "unknown doc " + tid}),
+                               "application/json; charset=utf-8", code=404)
+                    return
+            else:
+                _, id_index = scan()
+                if tid not in id_index:
+                    self._send(json.dumps({"ok": False, "error": "unknown ticket " + tid}),
+                               "application/json; charset=utf-8", code=404)
+                    return
             try:
                 pins = load_pins()
                 if want:
@@ -5973,6 +6169,11 @@ def _transform_html(s):
         s = s.replace("__HDR_ICON__", html.escape(HEADER_ICON))
     if "__PROJECT_LINKS__" in s:
         s = s.replace("__PROJECT_LINKS__", _LINK_ADD_BTN + render_project_links())
+    if "__DOC_SERIES__" in s:
+        s = s.replace("__DOC_SERIES__", "".join(
+            '<a class="hbtn" href="%s">%ss &nearr;</a>'
+            % (html.escape(sr["href"]), html.escape(sr["prefix"]))
+            for sr in doc_series()))
     if THEME_OVERRIDE_CSS:
         s = s.replace("</head>", "<style>" + THEME_OVERRIDE_CSS + "</style></head>", 1)
     s = s.replace("</body>", _FOOTER + "</body>", 1)
@@ -5991,6 +6192,9 @@ def _transform_html(s):
     # Wire copy-ids + CSV toolbars (ticket lists) and single-item copy buttons.
     if ("list-tools" in s or "copy-one" in s) and "</body>" in s:
         s = s.replace("</body>", _LIST_TOOLS + "</body>", 1)
+    # Every fenced code block gets a hover "copy" button, on any page.
+    if "<pre" in s and "</body>" in s:
+        s = s.replace("</body>", _CODE_COPY + "</body>", 1)
     return s
 
 
@@ -6018,7 +6222,7 @@ def apply_config(conf):
     Missing keys keep the current (default) value, so partial configs are fine."""
     global PFX, ID_DIGITS, BRAND, FAVICON, HEADER_ICON, EYEBROW, TAGLINE
     global SERVER_PORT, EPIC_TITLES, EPIC_EMOJI, THEME_REMAP, THEME_STRIP, _IDRE
-    global THEME_OVERRIDE_CSS, LINKS
+    global THEME_OVERRIDE_CSS, LINKS, DOC_RULES
     global TICKET_ID_RE, EPIC_CODE_RE, TICKET_PARTS_RE, DEP_ID_RE, SUB_ID_RE
     global TICKET_LINK_RE, EPIC_LINK_RE, _MD_EPIC_FILE_RE, _MD_TICKET_FILE_RE
 
@@ -6055,6 +6259,20 @@ def apply_config(conf):
     else:
         EPIC_TITLES = dict(_DEF_EPIC_TITLES)
         EPIC_EMOJI = dict(_DEF_EPIC_EMOJI)
+
+    # Document-link rules: a generic version of the built-in ADR rule. Each
+    # rule autolinks PREFIX-### mentions to the matching file under its dir.
+    DOC_RULES = []
+    for rule in conf.get("documents") or []:
+        if not isinstance(rule, dict):
+            continue
+        pfx = str(rule.get("prefix", "")).strip().upper()
+        rel = str(rule.get("dir", "")).strip().strip("/")
+        if (not re.match(r"^[A-Z][A-Z0-9]*$", pfx) or not rel or ".." in rel
+                or pfx in (PFX, "ADR")):   # ticket ids and ADRs already link
+            continue
+        DOC_RULES.append({"prefix": pfx, "dir": rel,
+                          "title": str(rule.get("title") or "").strip()})
 
     THEME_REMAP, THEME_STRIP, THEME_OVERRIDE_CSS = resolve_theme(conf.get("theme", "blue"))
     SERVER_PORT = int(conf.get("server", {}).get("port", _DEF["port"]))
@@ -6110,6 +6328,28 @@ def _load_registry_roots(path):
     return [r for r in repos if isinstance(r, str)]
 
 
+def save_registry_order(path, roots):
+    """Persist a new interface order, keeping registry entries that aren't
+    currently served (missing tickets/, filtered at launch) and any other
+    keys the file carries."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            data = {"repos": data if isinstance(data, list) else []}
+    except (OSError, ValueError):
+        data = {}
+    existing = [r for r in data.get("repos", []) if isinstance(r, str)]
+    served = set(roots)
+    data["repos"] = list(roots) + [r for r in existing
+                                   if os.path.abspath(r) not in served]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+
+
 def refresh_registry():
     """Follow live registry edits (`interfacile init` / `register` /
     `unregister`) without a hub restart. Runs per request under the request
@@ -6151,20 +6391,60 @@ def _slugify(base, seen):
 
 
 def build_registry(repo_roots):
-    """Load each repo's config into an Interface and index by slug (CLI order)."""
+    """Load each repo's config into an Interface and index by slug (CLI order).
+
+    Shortcuts are positional, never configured: the first ten interfaces get
+    the keys 1-9 then 0, the rest get none. Reorder (drag the switcher list,
+    or `interfacile shortcut N`) and the numbers follow."""
     global INTERFACES, _IFACE_BY_SLUG
     INTERFACES, _IFACE_BY_SLUG, seen = [], {}, set()
-    for r in repo_roots:
+    for i, r in enumerate(repo_roots):
         root = os.path.abspath(r)
         conf = load_config(root)
         brand = conf.get("brand", {})
         name = brand.get("name") or os.path.basename(root)
         icon = brand.get("icon") or brand.get("favicon") or _DEF["icon"]
-        sc = str(conf.get("shortcut", "") or "").strip()
-        it = Interface(_slugify(os.path.basename(root), seen), name, icon, root, conf, sc)
+        key = "1234567890"[i] if i < 10 else ""
+        it = Interface(_slugify(os.path.basename(root), seen), name, icon, root, conf, key)
         INTERFACES.append(it)
         _IFACE_BY_SLUG[it.slug] = it
+    _warn_shared_prefixes()
     return INTERFACES
+
+
+def _iface_prefix(it):
+    """An interface's ticket-id prefix, from its config (else its inference)."""
+    pfx = ((it.conf.get("ids") or {}).get("prefix") or "").strip().upper()
+    return pfx
+
+
+def _owner_interface(tid):
+    """The interface whose id prefix owns this ticket id — when that isn't the
+    active one. Lets /ticket/<id> URLs resolve hub-wide instead of 404ing
+    because the "wrong" project was active."""
+    m = re.match(r"([A-Za-z]+)-", tid or "")
+    if not m or len(INTERFACES) <= 1:
+        return None
+    pfx = m.group(1).upper()
+    active = _IFACE_BY_SLUG.get(ACTIVE_SLUG)
+    for it in INTERFACES:
+        if it is not active and _iface_prefix(it) == pfx:
+            return it
+    return None
+
+
+def _warn_shared_prefixes():
+    """Two interfaces sharing an id prefix makes ids ambiguous hub-wide —
+    cross-interface ticket links stop being able to pick an owner."""
+    seen = {}
+    for it in INTERFACES:
+        pfx = _iface_prefix(it)
+        if pfx and pfx in seen:
+            sys.stderr.write("warning: %s and %s both use the id prefix %s- — "
+                             "ticket links across the hub will be ambiguous\n"
+                             % (seen[pfx].slug, it.slug, pfx))
+        elif pfx:
+            seen[pfx] = it
 
 
 def activate(iface):
@@ -6205,6 +6485,41 @@ _FOOTER = (
     % (_REPO_URL, _GH_PATH)
 )
 
+# A hover "copy" affordance on every <pre> code block. Injected by
+# _transform_html wherever a page contains one, so ticket bodies, docs, and
+# ADRs all get it without each renderer knowing about it.
+_CODE_COPY = """<style>
+pre{position:relative}
+pre .code-copy{position:absolute;top:6px;right:6px;padding:5px 9px;cursor:pointer;
+font:600 10.5px/1 var(--font-sans,var(--font,system-ui));border-radius:7px;
+border:1px solid var(--line,#d6dde5);background:var(--surface,#fff);
+color:var(--ink-mut,var(--mut,#8a8a8a));opacity:0;transition:opacity .12s}
+pre:hover .code-copy,pre .code-copy:focus-visible{opacity:1}
+pre .code-copy:hover{color:var(--accent,#666);border-color:var(--accent,#888)}
+</style><script>(function(){
+Array.prototype.forEach.call(document.querySelectorAll('pre'),function(pre){
+  if(pre.querySelector('.code-copy'))return;
+  var code=pre.querySelector('code'),text=(code||pre).textContent;
+  var b=document.createElement('button');
+  b.type='button';b.className='code-copy';b.textContent='copy';
+  b.title='Copy this code block';
+  b.addEventListener('click',function(){
+    function done(ok){b.textContent=ok?'copied \\u2713':'copy failed';
+      setTimeout(function(){b.textContent='copy';},1400);}
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(function(){done(true);},
+        function(){done(false);});
+    }else{
+      var ta=document.createElement('textarea');ta.value=text;
+      document.body.appendChild(ta);ta.select();
+      try{done(document.execCommand('copy'));}catch(e){done(false);}
+      document.body.removeChild(ta);
+    }
+  });
+  pre.appendChild(b);
+});
+})();</script>"""
+
 _SWITCHER_CSS = """
 body{padding-top:52px}
 #ifc-bar{position:fixed;top:0;left:0;right:0;z-index:200;display:flex;align-items:center;gap:12px;
@@ -6243,6 +6558,10 @@ cursor:pointer;transition:background .1s}
 color:var(--ink,#15202b);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #ifc-menu li .ifc-sub{font:500 11px/1 var(--font-mono,ui-monospace,SFMono-Regular,monospace);
 color:var(--ink-mut,var(--mut,#8a8a8a));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#ifc-menu li[draggable]{cursor:grab}
+#ifc-menu li.ifc-drag{opacity:.45}
+.ifc-hint{float:right;font:500 10px/1.6 var(--font-sans,var(--font,system-ui));
+color:var(--ink-mut,var(--mut,#8a8a8a));text-transform:none;letter-spacing:0}
 #ifc-menu li .ifc-kbd{flex:none;font:600 11px/1 var(--font-mono,ui-monospace,monospace);
 color:var(--ink-mut,var(--mut,#8a8a8a));background:var(--surface-2,var(--surface2,#f2f4f8));
 border:1px solid var(--line,#d6dde5);border-bottom-width:2px;border-radius:6px;
@@ -6352,8 +6671,31 @@ function go(slug){document.cookie='ifc='+encodeURIComponent(slug)+';path=/;max-a
 location.href='/';}
 if(cur&&menu){
 cur.addEventListener('click',function(e){e.stopPropagation();set(!menu.classList.contains('open'));});
-menu.addEventListener('click',function(e){var li=e.target.closest('li[data-slug]');if(li)go(li.getAttribute('data-slug'));});
+menu.addEventListener('click',function(e){var li=e.target.closest('li[data-slug]');
+if(li&&!justDragged())go(li.getAttribute('data-slug'));});
 document.addEventListener('click',function(){set(false);});
+}
+/* drag an interface to a new spot; the first ten positions get keys 1-9, 0.
+   The order is saved to the registry, so it survives restarts. */
+var dragging=null,dragEnd=0;
+function justDragged(){return Date.now()-dragEnd<400;}
+if(menu&&menu.querySelector('li[draggable]')){
+menu.addEventListener('dragstart',function(e){var li=e.target.closest('li[data-slug]');
+if(!li)return;dragging=li;li.classList.add('ifc-drag');
+e.dataTransfer.effectAllowed='move';
+try{e.dataTransfer.setData('text/plain',li.getAttribute('data-slug'));}catch(err){}});
+menu.addEventListener('dragover',function(e){if(!dragging)return;e.preventDefault();
+e.dataTransfer.dropEffect='move';
+var li=e.target.closest('li[data-slug]');if(!li||li===dragging)return;
+var r=li.getBoundingClientRect();
+li.parentNode.insertBefore(dragging,(e.clientY-r.top)<r.height/2?li:li.nextSibling);});
+menu.addEventListener('drop',function(e){e.preventDefault();});
+menu.addEventListener('dragend',function(){if(!dragging)return;
+dragging.classList.remove('ifc-drag');dragging=null;dragEnd=Date.now();
+var slugs=Array.prototype.map.call(menu.querySelectorAll('li[data-slug]'),
+function(li){return li.getAttribute('data-slug');});
+fetch('/api/ifc-order',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({slugs:slugs})}).then(function(){location.reload();});});
 }
 /* per-interface shortcut key switches from anywhere (ignored while typing) */
 var keymap={};
@@ -6597,17 +6939,22 @@ def _switcher_html(is_dash=True):
         return ("<span class='ifc-n'>%s<span class='ifc-i'>%s</span></span>"
                 % (html.escape(it.name), html.escape(it.icon or "")))
 
+    # Registry-driven hubs can be reordered by dragging; the keys follow the
+    # order (first ten get 1-9 then 0), so there is nothing to configure.
+    drag = " draggable='true' title='drag to reorder'" if REGISTRY_FILE else ""
     rows = []
     for it in INTERFACES:
         kbd = ("<span class='ifc-kbd'>%s</span>" % html.escape(it.shortcut)) if it.shortcut else ""
         rows.append(
-            "<li role='option' data-slug='%s'%s%s>"
+            "<li role='option' data-slug='%s'%s%s%s>"
             "<span class='ifc-txt'>%s<span class='ifc-sub'>%s</span></span>%s"
             "<span class='ifc-chk' aria-hidden='true'>&#10003;</span></li>"
             % (html.escape(it.slug),
                " data-key='%s'" % html.escape(it.shortcut) if it.shortcut else "",
                " aria-selected='true'" if it.slug == ACTIVE_SLUG else "",
-               _name(it), _sub(it), kbd))
+               drag, _name(it), _sub(it), kbd))
+    hint = ("<span class='ifc-hint'>drag to reorder &middot; keys follow</span>"
+            if REGISTRY_FILE else "")
     # On the dashboard these stay empty (its own controls relocate here via JS);
     # on every other page we render github + links + notes so they follow you.
     center, actions = ("", "")
@@ -6619,7 +6966,8 @@ def _switcher_html(is_dash=True):
         + _name(active)
         + "<span class='ifc-caret' aria-hidden='true'>&#9662;</span></button>"
         "<ul id='ifc-menu' role='listbox'>"
-        "<li class='ifc-hd' aria-hidden='true' style='cursor:default'>Switch interface</li>"
+        "<li class='ifc-hd' aria-hidden='true' style='cursor:default'>Switch interface"
+        + hint + "</li>"
         + "".join(rows) + "</ul>"
         "</div>" + home
         + "<div id='ifc-center'>" + center + "</div>"

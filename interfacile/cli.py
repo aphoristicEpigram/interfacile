@@ -9,7 +9,8 @@
                                       (offers a wizard to create your first epics)
     interfacile epics  [PATH]         create more epics interactively (folder + charter)
     interfacile skills [PATH]         install/refresh the ticket-flow skills + process doc
-    interfacile shortcut [KEY]        show/set/clear this repo's hub switcher key
+    interfacile shortcut [N]          show this repo's hub key, or move it to position N
+                                      (keys are positional: first ten repos get 1-9, 0)
     interfacile register   [PATH]     add a repo to the hub registry
     interfacile unregister [PATH]     remove a repo from the registry
     interfacile list                  list registered interfaces
@@ -290,42 +291,47 @@ def cmd_skills(args):
     _install_skills(root, prefix, force=args.force)
 
 
-def cmd_shortcut(args):
-    """Show, set, or clear the single key the hub uses to switch to this repo."""
-    root = os.path.abspath(args.repo or os.getcwd())
-    path = os.path.join(root, server.CONFIG_REL)
-    if not os.path.isfile(path):
-        sys.exit("interfacile shortcut: no %s here — run `interfacile init` first."
-                 % server.CONFIG_REL)
-    conf = server.load_config(root)
-    current = str(conf.get("shortcut", "") or "").strip()
+def _position_key(i):
+    """Hub keys are positional: 1-9 then 0 for the first ten, nothing after."""
+    return "1234567890"[i] if i < 10 else ""
 
-    if args.clear:
-        if not current:
-            print("no shortcut set.")
-            return
-        conf.pop("shortcut", None)
-        _write(path, json.dumps(conf, indent=2, ensure_ascii=False) + "\n")
-        print("shortcut '%s' cleared." % current)
-        return
+
+def _print_order(repos, root=None):
+    for i, r in enumerate(repos):
+        key = _position_key(i)
+        mark = "  <- here" if root and os.path.abspath(r) == root else ""
+        print("  [%s] %s%s" % (key or " ", r, mark))
+
+
+def cmd_shortcut(args):
+    """Show or set this repo's hub key. Keys are positional — `shortcut 3`
+    means "move to position 3" — so this is just registry reordering; the
+    same thing as dragging the interface in the hub's switcher menu."""
+    root = os.path.abspath(args.repo or os.getcwd())
+    data = _registry_load()
+    repos = data["repos"]
+    if root not in repos:
+        sys.exit("interfacile shortcut: %s is not registered — run "
+                 "`interfacile init` or `interfacile register` first." % root)
 
     if args.key is None:
-        print("shortcut: %s" % (current or "(none)  — set one: interfacile shortcut 1"))
+        key = _position_key(repos.index(root))
+        print("shortcut: %s  (keys follow hub order; move with "
+              "`interfacile shortcut N` or drag in the switcher)"
+              % (key or "none — position %d" % (repos.index(root) + 1)))
+        _print_order(repos, root)
         return
 
     key = args.key.strip()
-    if len(key) != 1 or not key.isalnum():
-        sys.exit("interfacile shortcut: KEY must be a single letter or digit.")
-    # A duplicate key would make the hub switch to whichever repo wins; warn early.
-    for other in registry_repos():
-        if os.path.abspath(other) == root:
-            continue
-        taken = str(server.load_config(other).get("shortcut", "") or "").strip()
-        if taken == key:
-            print("note: '%s' is already used by %s" % (key, other))
-    conf["shortcut"] = key
-    _write(path, json.dumps(conf, indent=2, ensure_ascii=False) + "\n")
-    print("shortcut set: press '%s' anywhere in the hub to switch here." % key)
+    if key not in "1234567890" or len(key) != 1:
+        sys.exit("interfacile shortcut: pass a digit 1-9, or 0 for the tenth slot.")
+    pos = 9 if key == "0" else int(key) - 1
+    repos.remove(root)
+    repos.insert(min(pos, len(repos)), root)
+    _registry_save(data)
+    print("press '%s' anywhere in the hub to switch here. New order:" % key)
+    _print_order(repos, root)
+    print("(a running hub picks this up on the next refresh)")
 
 
 def cmd_init(args):
@@ -387,14 +393,13 @@ def cmd_list(args):
         print("no interfaces registered.  (registry: %s)" % registry_path())
         return
     print("registered interfaces (%s):" % registry_path())
-    for r in repos:
+    for i, r in enumerate(repos):
         conf = server.load_config(r)
         name = conf.get("brand", {}).get("name") or os.path.basename(r)
         icon = conf.get("brand", {}).get("icon") or conf.get("brand", {}).get("favicon") or "•"
-        key = str(conf.get("shortcut", "") or "").strip()
-        key = ("[%s]" % key) if key else "   "
+        key = _position_key(i)
         flag = "" if os.path.isdir(os.path.join(r, "tickets")) else "   [!] missing tickets/"
-        print("  %s %s %-22s %s%s" % (key, icon, name, r, flag))
+        print("  [%s] %s %-22s %s%s" % (key or " ", icon, name, r, flag))
 
 
 # --------------------------------------------------------------------------- #
@@ -451,10 +456,11 @@ def main(argv=None):
     kp.add_argument("--force", action="store_true",
                     help="also overwrite tickets/README.md with the packaged version")
 
-    cp = sub.add_parser("shortcut", help="show/set/clear this repo's hub switcher key")
+    cp = sub.add_parser("shortcut", help="show/set this repo's hub key (keys are "
+                                         "positional: 1-9 then 0)")
     cp.add_argument("key", nargs="?", default=None,
-                    help="single letter or digit; omit to show the current key")
-    cp.add_argument("--clear", action="store_true", help="remove the shortcut")
+                    help="digit 1-9 (0 = tenth slot) — moves this repo to that "
+                         "position; omit to show the current key")
     cp.add_argument("--repo", default=None, metavar="PATH",
                     help="repo root (default: current directory)")
 

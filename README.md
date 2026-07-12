@@ -33,7 +33,11 @@ looks, alongside the (git-ignored) scratchpad, to-do, and pin state.
 - 📋 **Live markdown tickets** — one folder per epic, YAML front-matter, rendered
   and editable in place. No database, no build step.
 - 📈 **Real dashboards** — burn-up, throughput, priority×risk matrix, effort
-  remaining, dependency chains, per-epic breakdowns, health KPIs.
+  remaining, dependency chains, per-epic breakdowns, health KPIs — including
+  created/closed **today**, one click from the matching list.
+- 📌 **Pin anything** — tickets *and* docs sit in the same pinned panel; every
+  code block gets a hover **copy** button; ticket links work hub-wide (an id
+  from another project redirects to the interface that owns its prefix).
 - 🛰️ **Multi-interface hub** — serve many repos from one process and switch
   between them with a dropdown or a **per-project keyboard shortcut**.
 - 🎫 **A built-in ticket flow** — `new`, `tickets`, `ready`, `close`, `lint`
@@ -172,9 +176,8 @@ A hub that's already running picks the new repo up by itself — the registry is
 re-read when it changes, so the switcher updates on your next refresh.
 
 **5. Make it yours (optional).** Edit the generated `.interfacile/config.json` to
-set the brand name, favicon, epics, theme, `shortcut` (give each repo a distinct
-key), and `server.port` (give each repo a distinct port). See
-[Configuring an interface](#configuring-an-interface).
+set the brand name, favicon, epics, theme, and `server.port` (give each repo a
+distinct port). See [Configuring an interface](#configuring-an-interface).
 
 Save the file and **refresh** — the config is re-read on change, so you don't
 need to restart anything to see it.
@@ -216,17 +219,19 @@ interfacile hub --repo /path/to/repo-a --repo /path/to/repo-b
 
 The registry lives at `~/.config/interfacile/registry.json`. The hub opens at a
 tidy branded loopback URL like `http://interfacile.localhost:8788/` (plain
-`http://localhost:8788/` works too). Give each repo a switcher key and you can
-jump straight to it from anywhere in the hub:
+`http://localhost:8788/` works too).
+
+**Switcher keys are positional — nothing to configure.** The first ten
+interfaces answer to `1`–`9` then `0`, in switcher order; press the key
+anywhere in the hub to jump. To change a repo's key, change its position:
+**drag it** in the switcher dropdown (the keycaps follow), or from a terminal:
 
 ```bash
-interfacile shortcut 3        # press '3' anywhere in the hub to switch here
-interfacile shortcut          # show the current key
-interfacile shortcut --clear  # remove it
+interfacile shortcut 1        # move this repo to position 1 — its key is now '1'
+interfacile shortcut          # show this repo's key and the full order
 ```
 
-Setting a key warns if another registered repo already uses it, and
-`interfacile list` shows every repo's key.
+`interfacile list` shows the whole order with its keys.
 
 ## Configuring an interface
 
@@ -239,8 +244,11 @@ A hidden `.interfacile/config.json` at a repo root controls that interface:
 | `epics` | per-epic titles + emoji |
 | `links` | quick links in the header (`emoji`, `title`, `url`) |
 | `theme` | a preset name, or a full custom palette |
-| `shortcut` | a key that switches to this interface from anywhere |
+| `documents` | document series (`PR-###`, `RFC-###`) — the full ADR treatment: linked mentions, an index page, the jump box |
 | `server.port` | default port |
+
+(Hub switcher keys aren't configured — they follow the switcher order:
+first ten get `1`–`9` then `0`. Drag to reorder, or `interfacile shortcut N`.)
 
 **Quick links** — add a `links` list to put your own buttons in the header, next
 to the pin/scratchpad. Each is `{ "emoji", "title", "url" }`; add as many as you

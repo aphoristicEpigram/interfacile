@@ -10,6 +10,7 @@
     "digits": 4
   },
   "theme": "teal",
-  "shortcut": "1",
-  "server": { "port": 8787 }
+  "server": {
+    "port": 8787
+  }
 }
