@@ -1,6 +1,6 @@
 ---
 id: IF-0048
-title: Created today / closed today KPIs
+title: Created today / closed today, in a header pocket
 epic: IF-E007
 status: CLOSED
 risk: LOW
@@ -9,10 +9,10 @@ effort: 1h
 created: 2026-07-13
 closed: 2026-07-13
 updated: 2026-07-13
-index_note: two tiles head the KPI row; /filter created=today closed=today shorthands
+index_note: compact today pocket in the header (eyebrow <-> buttons); /filter created=today closed=today shorthands
 ---
 
-# IF-0048 · Created today / closed today KPIs
+# IF-0048 · Created today / closed today, in a header pocket
 
 ## Context
 
@@ -22,13 +22,20 @@ today, and a click through to those lists.
 
 ## Approach
 
-Two tiles at the head of the KPI row, using the existing tile component:
-counts by exact `created:`/`closed:` date with a 7-day sub-stat, clicking
-through to `/filter?created=today` / `?closed=today` — new server-side
-shorthands (static tile hrefs can't compute dates; the server can).
+A compact "today" pocket at the very top of the page, sitting in the header
+row between the eyebrow and the header buttons (first cut put these in the
+KPI row; moved on feedback — the ask was TOP top, and small). Clicking the
+label cycles the window subtly: today → 7 days → 30 days (rolling, remembered
+in localStorage), counts and click-throughs following. The lists come from
+`/filter?created=today|week|month` / `?closed=…` — new server-side shorthands
+(static hrefs can't compute dates; the server can).
 
 ## Acceptance criteria
 
-- [x] Tiles render first in the KPI row with live counts and 7-day subs.
-- [x] Click-through lists show exactly the tickets created/closed today.
+- [x] Pocket renders in the header row, small, with live counts; hidden
+      until data loads.
+- [x] Label click cycles today / 7 days / 30 days; choice sticks across
+      reloads.
+- [x] Click-through lists match each window exactly (verified: today's
+      closes vs the week's over HTTP).
 - [x] Shorthands compose with the existing filter params.

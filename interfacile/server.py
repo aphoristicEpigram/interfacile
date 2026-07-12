@@ -63,6 +63,7 @@ THEME_STRIP = None               # signature-strip colours, or None
 THEME_OVERRIDE_CSS = ""          # custom-palette :root override, or ""
 LINKS = []                       # per-project quick links: list of {emoji,title,url}
 DOC_RULES = []                   # doc-link rules: list of {prefix,dir} from config
+THEME_NAME = "blue"              # active theme's name ("custom" for a palette dict)
 
 # Frozen copies of the built-in defaults. apply_config() falls back to *these*
 # for any missing key, so switching interfaces resets cleanly instead of
@@ -1950,11 +1951,13 @@ def render_filter_page(data, q):
     stale = int(qv("stale")) if qv("stale").isdigit() else None
     c_from, c_to = parse_date(qv("closed_from")), parse_date(qv("closed_to"))
     n_from, n_to = parse_date(qv("created_from")), parse_date(qv("created_to"))
-    # Shorthands for static links (the KPI tiles): the server knows the date.
-    if qv("created") == "today":
-        n_from = n_to = today
-    if qv("closed") == "today":
-        c_from = c_to = today
+    # Shorthands for static links (the header "today" pocket): the server
+    # knows the date. week/month are rolling windows, matching the pocket.
+    windows = {"today": 0, "week": 6, "month": 29}
+    if qv("created") in windows:
+        n_from, n_to = today - datetime.timedelta(days=windows[qv("created")]), today
+    if qv("closed") in windows:
+        c_from, c_to = today - datetime.timedelta(days=windows[qv("closed")]), today
     label = qv("label") or "Filtered tickets"
 
     def keep(st, t):
@@ -2093,6 +2096,20 @@ DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 .head{background:var(--surface);border:1px solid var(--line);border-radius:calc(var(--r) + 3px);
 box-shadow:var(--shadow);padding:clamp(20px,3.5vw,34px);position:relative;overflow:hidden}
 .head-top{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px 20px;margin-top:6px}
+/* the "today" pocket: created/closed today, sitting between the eyebrow and
+   the header buttons — small on purpose */
+.today-pocket{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);
+border-radius:100px;padding:4px 12px;background:var(--surface)}
+.today-pocket .tp-lab{font-family:var(--font-mono);font-size:.62rem;letter-spacing:.09em;
+text-transform:uppercase;color:var(--ink-mut);border:0;background:none;padding:0;
+cursor:pointer}
+.today-pocket .tp-lab:hover{color:var(--accent-ink)}
+.today-pocket .tp-item{font-family:var(--font-mono);font-size:.72rem;color:var(--ink-mut);
+text-decoration:none}
+.today-pocket .tp-item b{font-weight:750;font-size:.82rem}
+.today-pocket .tp-new b{color:var(--accent-ink)}
+.today-pocket .tp-done b{color:var(--done)}
+.today-pocket .tp-item:hover{color:var(--accent-ink)}
 h1{font-size:clamp(1.9rem,4.4vw,2.9rem);line-height:1.02;letter-spacing:-.03em;font-weight:800;margin:.28em 0 0;text-wrap:balance}
 .tagline{font-size:clamp(1rem,2vw,1.16rem);color:var(--ink-2);margin:.7em 0 0;max-width:62ch}
 .tagline b{color:var(--ink);font-weight:600}
@@ -2530,6 +2547,11 @@ section.collapsed .sec-head{margin-bottom:0}
   <header class="head">
     <div class="head-top">
       <span class="eyebrow">__EYEBROW__</span>
+      <span class="today-pocket" id="todayPocket" hidden>
+        <button class="tp-lab" id="tp-win" type="button" title="Switch window: today / week / month">today</button>
+        <a class="tp-item tp-new" id="tp-new-a" href="/filter?created=today&label=Created%20today"><b id="tp-new">0</b> created</a>
+        <a class="tp-item tp-done" id="tp-done-a" href="/filter?closed=today&status=closed&label=Closed%20today"><b id="tp-done">0</b> closed</a>
+      </span>
       <span class="head-btns">
         <a id="ghBtn" class="ghbtn" hidden target="_blank" rel="noopener">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -2591,8 +2613,6 @@ section.collapsed .sec-head{margin-bottom:0}
     <a href="#sec-epics"><b>07</b>Epics</a>
   </nav>
   <div class="kpis">
-    <div class="kpi is-open clickable" data-href="/filter?created=today&label=Created%20today" title="Tickets created today. Click for the list."><span class="k-val" id="k-newtoday">&mdash;</span><span class="k-lab">Created today</span><span class="k-sub" id="k-newtoday-sub">&nbsp;</span></div>
-    <div class="kpi is-done clickable" data-href="/filter?closed=today&status=closed&label=Closed%20today" title="Tickets closed today. Click for the list."><span class="k-val" id="k-donetoday">&mdash;</span><span class="k-lab">Closed today</span><span class="k-sub" id="k-donetoday-sub">&nbsp;</span></div>
     <div class="kpi clickable" data-href="/filter?label=All%20tickets" title="Click for the full ticket list"><span class="k-val" id="k-total">&mdash;</span><span class="k-lab">Tickets tracked</span><span class="k-sub" id="k-total-sub">&nbsp;</span></div>
     <div class="kpi is-done clickable" data-href="/filter?status=closed&label=Closed%20and%20shipped" title="Click for all closed tickets"><span class="k-val" id="k-closed">&mdash;</span><span class="k-lab">Closed &amp; shipped</span><span class="k-sub" id="k-closed-sub">&nbsp;</span></div>
     <div class="kpi is-open clickable" data-href="/filter?status=open&label=Open%20tickets" title="Click for all open tickets"><span class="k-val" id="k-open">&mdash;</span><span class="k-lab">Open</span><span class="k-sub" id="k-open-sub">&nbsp;</span></div>
@@ -2778,6 +2798,7 @@ section.collapsed .sec-head{margin-bottom:0}
   <footer>
     <p><span class="mono">Live scan</span> of <span class="mono" id="foot-src">tickets/</span> frontmatter &mdash; counts every ticket file (<span class="mono">id: __PFX__-####</span>), including compound sub-tickets, so totals reflect real files on disk rather than the generated index.</p>
     <p><span class="mono" id="foot-time">&nbsp;</span></p>
+    __THEME_PICKER__
   </footer>
 </div></div>
 <script>
@@ -3295,23 +3316,47 @@ section.collapsed .sec-head{margin-bottom:0}
     var finishing=d.epics.filter(function(e){return e.open===1;}).length;
     document.getElementById("k-complete").textContent=complete;
     document.getElementById("k-complete-sub").textContent=finishing+" more at 1 open";
-    /* today's momentum: counts by exact created/closed date, local time */
+    /* the "today" pocket — created/closed counts over a day/week/month
+       window (rolling, local time); clicking the label cycles the window */
     function isoDay(dt){return dt.getFullYear()+"-"+("0"+(dt.getMonth()+1)).slice(-2)+"-"+("0"+dt.getDate()).slice(-2);}
-    var now=new Date(),todayI=isoDay(now),
-        weekI=isoDay(new Date(now.getTime()-6*864e5)),
-        newToday=0,doneToday=0,newWeek=0,doneWeek=0;
+    var now=new Date(),
+        WINS=[{key:"today",lab:"today",days:0},
+              {key:"week",lab:"7 days",days:6},
+              {key:"month",lab:"30 days",days:29}],
+        counts={};
+    WINS.forEach(function(w){counts[w.key]={created:0,closed:0,
+      from:isoDay(new Date(now.getTime()-w.days*864e5))};});
     d.epics.forEach(function(e){
       [].concat(e.openTickets||[],e.closedTickets||[],e.wfTickets||[],e.standingTickets||[])
         .forEach(function(x){
-          if(x.created===todayI)newToday++;
-          if(x.created&&x.created>=weekI)newWeek++;
-          if(x.closed===todayI)doneToday++;
-          if(x.closed&&x.closed>=weekI)doneWeek++;});
+          WINS.forEach(function(w){
+            if(x.created&&x.created>=counts[w.key].from)counts[w.key].created++;
+            if(x.closed&&x.closed>=counts[w.key].from)counts[w.key].closed++;});});
     });
-    document.getElementById("k-newtoday").textContent=newToday;
-    document.getElementById("k-newtoday-sub").textContent=newWeek+" in last 7d";
-    document.getElementById("k-donetoday").textContent=doneToday;
-    document.getElementById("k-donetoday-sub").textContent=doneWeek+" in last 7d";
+    var tpWin=document.getElementById("tp-win");
+    function showWin(key){
+      var w=WINS.filter(function(x){return x.key===key;})[0]||WINS[0],c=counts[w.key];
+      tpWin.textContent=w.lab;
+      document.getElementById("tp-new").textContent=c.created;
+      document.getElementById("tp-done").textContent=c.closed;
+      document.getElementById("tp-new-a").href=
+        "/filter?created="+w.key+"&label="+encodeURIComponent("Created — "+w.lab);
+      document.getElementById("tp-done-a").href=
+        "/filter?closed="+w.key+"&status=closed&label="+encodeURIComponent("Closed — "+w.lab);
+      try{localStorage.setItem("ifcTodayWin",w.key);}catch(e){}
+    }
+    if(!tpWin.getAttribute("data-wired")){
+      tpWin.setAttribute("data-wired","1");
+      tpWin.addEventListener("click",function(){
+        var cur=localStorage.getItem("ifcTodayWin")||"today",
+            i=WINS.map(function(w){return w.key;}).indexOf(cur);
+        showWin(WINS[(i+1)%WINS.length].key);
+      });
+    }
+    var saved="today";
+    try{saved=localStorage.getItem("ifcTodayWin")||"today";}catch(e){}
+    showWin(saved);
+    document.getElementById("todayPocket").hidden=false;
   }
   function renderTracks(d){
     var complete=d.epics.filter(function(e){return e.open===0&&epTotal(e)>0;});
@@ -5704,6 +5749,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send(json.dumps({"ok": True, "html": rendered}),
                        "application/json; charset=utf-8")
             return
+        if self.path == "/api/theme":
+            # The footer picker: set this repo's theme preset in config.json.
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                name = json.loads(self.rfile.read(length).decode("utf-8"))["theme"]
+                if name not in THEMES and name not in PRESETS:
+                    raise ValueError("unknown theme %r" % name)
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": "bad request: " + str(exc)}),
+                           "application/json; charset=utf-8", code=400)
+                return
+            try:
+                save_theme(name)
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": str(exc)}),
+                           "application/json; charset=utf-8", code=500)
+                return
+            self._send(json.dumps({"ok": True, "theme": name}),
+                       "application/json; charset=utf-8")
+            return
         if self.path == "/api/links":
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -5922,6 +5987,90 @@ def resolve_theme(theme):
         return dict(t.get("remap", {})), (strip if strip is not None else t.get("strip")), ""
     t = THEMES["blue"]
     return dict(t.get("remap", {})), t.get("strip"), ""
+
+
+def theme_names():
+    """Every built-in theme, remap themes first (blue is the engine default)."""
+    return list(THEMES) + [n for n in PRESETS if n not in THEMES]
+
+
+def _theme_swatch_colors(name):
+    """(ground, accent) for a theme's footer dot. Remap themes aren't palette
+    dicts, so their two representatives are spelled out here."""
+    fixed = {"blue": ("#e9edf1", "#2b53e6"), "violet-neon": ("#ece7f2", "#0894b3")}
+    if name in fixed:
+        return fixed[name]
+    p = PRESETS[name]["light"]
+    return p["ground"], p["accent"]
+
+
+def save_theme(name):
+    """Write the chosen preset into the active repo's config.json (preserving
+    every other key) and re-resolve the live theme, so the very next render —
+    the reload the picker triggers — already wears it."""
+    global THEME_REMAP, THEME_STRIP, THEME_OVERRIDE_CSS, THEME_NAME
+    path = os.path.join(REPO_ROOT, CONFIG_REL)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            conf = json.load(fh)
+        if not isinstance(conf, dict):
+            conf = {}
+    except FileNotFoundError:
+        conf = {}
+    conf["theme"] = name
+    _ensure_state_dir()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(conf, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, path)
+    THEME_REMAP, THEME_STRIP, THEME_OVERRIDE_CSS = resolve_theme(name)
+    THEME_NAME = name
+    it = _IFACE_BY_SLUG.get(ACTIVE_SLUG)
+    if it is not None:
+        it.conf["theme"] = name
+        it._mtime = it._conf_mtime()
+
+
+def render_theme_picker():
+    """The quiet row of theme dots at the very bottom of the board. Clicking
+    one writes `theme` into this repo's config.json — the same file, the same
+    key you'd edit by hand."""
+    dots = []
+    for name in theme_names():
+        ground, accent = _theme_swatch_colors(name)
+        on = " on" if name == THEME_NAME else ""
+        dots.append(
+            "<button type='button' class='th-dot%s' data-theme='%s' "
+            "title='%s' aria-pressed='%s' style='background:%s;"
+            "box-shadow:inset 0 0 0 3px %s'></button>"
+            % (on, name, name, "true" if on else "false", accent, ground))
+    custom = ("<span class='th-custom'>custom palette &middot; pick a dot to "
+              "replace it</span>" if THEME_NAME == "custom" else "")
+    return (
+        "<div class='th-pick'><span class='th-lab'>theme</span>"
+        + "".join(dots) + custom + "</div>"
+        "<style>"
+        ".th-pick{display:flex;align-items:center;justify-content:center;gap:7px;"
+        "flex-wrap:wrap;margin-top:14px;opacity:.55;transition:opacity .15s}"
+        ".th-pick:hover{opacity:1}"
+        ".th-lab{font:500 10.5px/1 var(--font-mono,ui-monospace,monospace);"
+        "color:var(--ink-mut);margin-right:3px;text-transform:uppercase;"
+        "letter-spacing:.08em}"
+        ".th-dot{width:16px;height:16px;border-radius:50%;cursor:pointer;"
+        "border:1px solid var(--line);padding:0;transition:transform .12s}"
+        ".th-dot:hover{transform:scale(1.35)}"
+        ".th-dot.on{outline:2px solid var(--accent);outline-offset:2px}"
+        ".th-custom{font:500 10.5px/1 var(--font-sans,system-ui);color:var(--ink-mut)}"
+        "</style>"
+        "<script>(function(){"
+        "document.querySelectorAll('.th-pick .th-dot').forEach(function(b){"
+        "b.addEventListener('click',function(){"
+        "fetch('/api/theme',{method:'POST',headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({theme:b.getAttribute('data-theme')})})"
+        ".then(function(r){return r.json();})"
+        ".then(function(res){if(res.ok)location.reload();});});});"
+        "})();</script>")
 
 
 def _normalize_url(url):
@@ -6174,6 +6323,8 @@ def _transform_html(s):
             '<a class="hbtn" href="%s">%ss &nearr;</a>'
             % (html.escape(sr["href"]), html.escape(sr["prefix"]))
             for sr in doc_series()))
+    if "__THEME_PICKER__" in s:
+        s = s.replace("__THEME_PICKER__", render_theme_picker())
     if THEME_OVERRIDE_CSS:
         s = s.replace("</head>", "<style>" + THEME_OVERRIDE_CSS + "</style></head>", 1)
     s = s.replace("</body>", _FOOTER + "</body>", 1)
@@ -6274,7 +6425,14 @@ def apply_config(conf):
         DOC_RULES.append({"prefix": pfx, "dir": rel,
                           "title": str(rule.get("title") or "").strip()})
 
-    THEME_REMAP, THEME_STRIP, THEME_OVERRIDE_CSS = resolve_theme(conf.get("theme", "blue"))
+    theme = conf.get("theme", "blue")
+    THEME_REMAP, THEME_STRIP, THEME_OVERRIDE_CSS = resolve_theme(theme)
+    global THEME_NAME
+    if isinstance(theme, dict) and (theme.get("light") or theme.get("palette")):
+        THEME_NAME = "custom"
+    else:
+        name = theme.get("name") if isinstance(theme, dict) else theme
+        THEME_NAME = name if (name in THEMES or name in PRESETS) else "blue"
     SERVER_PORT = int(conf.get("server", {}).get("port", _DEF["port"]))
 
 

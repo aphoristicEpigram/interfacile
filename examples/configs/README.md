@@ -105,6 +105,11 @@ looking at. Built-ins:
 `blue`, `violet-neon`, `green`, `forest`, `teal`, `cyan`, `indigo`, `violet`,
 `rose`, `crimson`, `orange`, `amber`, `lime`, `slate`.
 
+The quickest way to try presets is from the board itself: a quiet row of
+swatches at the **very bottom of the dashboard** — click one and it writes
+this field into `config.json` for you (a custom palette shows as a "custom"
+chip there until you replace it).
+
 A custom theme is a small set of semantic roles for light and dark, plus an
 optional top signature strip:
 

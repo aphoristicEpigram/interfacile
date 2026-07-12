@@ -44,7 +44,8 @@ looks, alongside the (git-ignored) scratchpad, to-do, and pin state.
   straight from the CLI, plus agent skills (`new-ticket`, `work-ticket`,
   `close-ticket`, `ticket-status`) that `init` installs into your repo.
 - 🎨 **14 theme presets + custom palettes** — each interface gets a distinctive
-  background so you always know which project you're in. Light & dark automatic.
+  background so you always know which project you're in. Light & dark automatic,
+  switchable from the swatch row at the bottom of the board.
 - 🧰 **Zero dependencies** — standard-library Python 3.8+, one command to install.
 - 🔒 **Your data stays put** — tickets/scratchpad/todos live in each project's
   own repo; interfacile only reads them.
