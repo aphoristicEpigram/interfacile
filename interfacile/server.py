@@ -375,23 +375,103 @@ def save_pins(pins):
 # Scratch pad / to-do pop-outs: two free-form files in `.interfacile/`. No
 # history, no schema — the dashboard just reads and rewrites the whole file, so
 # whatever was there greets you on the next run.
-def load_note(which):
-    for path in (NOTE_FILES[which], LEGACY_NOTE_FILES[which]):
+def load_note_at(root, which):
+    """A note from any repo — the CLI reads roots the server isn't serving."""
+    for paths in (_state_paths, _legacy_state_paths):
         try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
+            with open(paths(root)[1][which], encoding="utf-8",
+                      errors="replace") as fh:
                 return fh.read()
         except OSError:
             continue
     return ""
 
 
-def save_note(which, content):
-    _ensure_state_dir()
-    path = NOTE_FILES[which]
+def save_note_at(root, which, content):
+    path = _state_paths(root)[1][which]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(content)
     os.replace(tmp, path)
+
+
+def load_note(which):
+    return load_note_at(REPO_ROOT, which)
+
+
+def save_note(which, content):
+    save_note_at(REPO_ROOT, which, content)
+
+
+# ...except the to-do note, which does have a shape: a markdown checkbox list.
+# The pop-out panel parses and rewrites it in JS; `interfacile todo` does the
+# same from the CLI, so the two agree on the format here rather than each
+# guessing. Tolerant on the way in (a bare line is an unchecked item — you can
+# paste a list in), strict on the way out (every item is `- [ ] text`).
+TODO_RE = re.compile(r"^[-*]\s*\[([ xX])\]\s*(.*)$")
+
+
+def parse_todo(text):
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = TODO_RE.match(line)
+        if m:
+            items.append({"done": m.group(1).lower() == "x", "text": m.group(2)})
+        else:
+            items.append({"done": False, "text": re.sub(r"^[-*]\s+", "", line)})
+    return items
+
+
+def serialize_todo(items):
+    return "".join("- [%s] %s\n" % ("x" if i["done"] else " ", i["text"])
+                   for i in items)
+
+
+def load_todo(root):
+    return parse_todo(load_note_at(root, "todo"))
+
+
+def save_todo(root, items):
+    save_note_at(root, "todo", serialize_todo(items))
+
+
+# The scratchpad, by contrast, has no format — it's prose, and it stays prose.
+# The one unit it does have is the block: a run of non-blank lines, which is how
+# a thought gets written and how it gets read. `interfacile scratch` numbers
+# those blocks so one can be pointed at the ticket it became. The id rules for
+# that pointer are the repo's, not ours — they live with the id scheme in
+# ticket.py; this half only knows where a block starts and stops.
+def scratch_blocks(text):
+    """(lines, spans) — spans are the [first, last] line index of each block,
+    over the keepends line list, so a rewrite can be byte-for-byte exact."""
+    lines = text.splitlines(True)
+    spans, start = [], None
+    for i, line in enumerate(lines):
+        if line.strip():
+            if start is None:
+                start = i
+        elif start is not None:
+            spans.append((start, i - 1))
+            start = None
+    if start is not None:
+        spans.append((start, len(lines) - 1))
+    return lines, spans
+
+
+def block_text(lines, span):
+    return "".join(lines[span[0]:span[1] + 1]).rstrip("\n")
+
+
+def set_line(lines, i, stem):
+    """Rewrite one line's content, keeping its ending — "" at EOF, so a file
+    that ended without a newline still does. Every other byte is untouched."""
+    eol = lines[i][len(lines[i].rstrip("\r\n")):]
+    lines[i] = stem + eol
+    return "".join(lines)
 
 
 def migrate_state(root):
@@ -483,6 +563,28 @@ def _epic_record(code, found_titles):
         "lastCreated": None, "lastClosed": None,
         "effortOpenH": 0.0, "effortDoneH": 0.0,
     }
+
+
+# The pocket's three windows, in one place: the counts (scan), the pages they
+# link to (/filter), and the label the bar prints all read from here, so "7 days"
+# can never mean one thing in the badge and another in the list behind it.
+POCKET_WINDOWS = (("today", 0, "today"), ("week", 6, "7 days"),
+                  ("month", 29, "30 days"))
+
+
+def pocket_counts(tickets):
+    """created/closed within each rolling window, counted on the server — the
+    top bar shows this on pages that never load the board."""
+    today = datetime.date.today()
+    out = {}
+    for key, days, _lab in POCKET_WINDOWS:
+        since = _iso(today - datetime.timedelta(days=days))
+        out[key] = {
+            "created": sum(1 for t in tickets
+                           if t.get("created") and t["created"] >= since),
+            "closed": sum(1 for t in tickets
+                          if t.get("closed") and t["closed"] >= since)}
+    return out
 
 
 def scan():
@@ -587,11 +689,15 @@ def scan():
             t.update(meta)
             ep["standingTickets"].append(t)
 
+        # Every ticket lands here — it is what the id index and the pocket counts
+        # are built from, and a ticket with no created date is still a ticket
+        # (the recently-created panel, which wants one, filters on it below).
+        all_tix.append({"id": tid, "title": title, "created": _iso(cdate),
+                        "closed": _iso(xdate), "status": status,
+                        "risk": meta["risk"], "priority": meta["priority"],
+                        "effort": meta["effort"], "effortH": effort_h,
+                        "epic": code})
         if cdate:
-            all_tix.append({"id": tid, "title": title, "created": _iso(cdate),
-                            "status": status, "risk": meta["risk"],
-                            "priority": meta["priority"], "effort": meta["effort"],
-                            "effortH": effort_h, "epic": code})
             all_created.append(cdate)
             if ep["lastCreated"] is None or cdate > ep["lastCreated"]:
                 ep["lastCreated"] = cdate
@@ -795,6 +901,12 @@ def scan():
                             last_worked["mtime"]).isoformat()}
                        if last_worked["mtime"] else None),
         "git": _git_info(),
+        # id -> status/title for every ticket. Captured notes (to-do items,
+        # scratchpad blocks) store an id and nothing else, so whatever shows
+        # them resolves the status here, live, and can never go stale.
+        "index": {t["id"]: {"status": t["status"], "title": t["title"]}
+                  for t in all_tix},
+        "pocket": pocket_counts(all_tix),
         # Every document series' records (ADRs plus configured ones) — the
         # key predates the generic series and the dashboard JS reads it.
         "adrs": [r for s in doc_series()
@@ -1531,31 +1643,12 @@ border:1px solid var(--line);border-radius:7px;padding:5px 9px;cursor:pointer}
 .mchip.pinned{color:var(--warn);border-color:var(--warn)}
 .mchip.pinned[data-unpin]{cursor:pointer}
 .mchip.pinned[data-unpin]:hover,.mchip.pinned[data-unpin]:focus-visible{color:#c23b3b;border-color:#c23b3b;text-decoration:line-through}
-/* card view — single-status filter pages get roomier tickets in a grid */
-.col.cards{background:transparent;border:0;overflow:visible}
-.col.cards .col-h{background:var(--surface2);border:1px solid var(--line);border-radius:7px}
-/* masonry columns: cards keep their natural height, so a tall family never
-   stretches the tickets beside it */
-.col.cards>ul{columns:330px;column-gap:12px;padding:12px 0}
-.col.cards>ul>li{break-inside:avoid;margin:0 0 12px}
-.col.cards li a{display:flex;flex-direction:column;align-items:stretch;gap:8px;
-background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:14px 16px}
-.col.cards li a:hover{border-color:var(--accent);background:var(--surface)}
-/* family card: parent + its __PFX__-####-X sub-tickets joined in one cell */
-.col.cards li.fam{border:1px solid var(--line);border-radius:9px;background:var(--surface);overflow:hidden}
-.col.cards li.fam ul{display:block;margin:0;padding:0}
-.col.cards li.fam li a{border:0;border-radius:0;height:auto}
-.col.cards li.fam li:not(:first-child) a{border-top:1px solid var(--line)}
-.col.cards li.fam li.child a{border-left:3px solid var(--accent);padding-left:13px}
-.col.cards li.fam li a:hover{background:var(--surface2)}
-.col.cards li.fam:not(:has(li[data-id]:not([hidden]))){display:none}
-.card-top{display:flex;align-items:baseline;gap:8px}
-.card-top .tk-id{min-width:0;font-size:.76rem}
-.card-top .tk-date{margin-left:auto}
-.card-ttl{font-size:.9rem;color:var(--ink);line-height:1.45;flex:1;text-wrap:pretty}
-.col-closed.cards .card-ttl,.col-wf.cards .card-ttl{color:var(--ink2)}
-.card-meta{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:auto}
-.card-sub{font-family:var(--mono);font-size:.66rem;color:var(--mut)}
+/* the unpinned pin: invisible until you're on the row, so a list of 40 tickets
+   doesn't read as a list of 40 buttons */
+.mchip.pin-add{cursor:pointer;opacity:0;border-color:transparent;transition:opacity .12s}
+li:hover .mchip.pin-add,.card:hover .mchip.pin-add{opacity:.5}
+.mchip.pin-add:hover,.mchip.pin-add:focus-visible{opacity:1;color:var(--warn);border-color:var(--warn)}
+@media (hover:none){.mchip.pin-add{opacity:.5}}
 """
 
 
@@ -1578,12 +1671,22 @@ LIST_FILTER_BAR = """
   <label class="sortlab">blocked <select id="lfBlk" class="sortsel">
     <option value="">all</option><option value="y">blocked</option>
     <option value="n">unblocked</option></select></label>
-  <label class="sortlab">sort <select id="lfSort" class="sortsel">
-    <option value="">default</option><option value="risk">by risk</option>
-    <option value="priority">by priority</option>
-    <option value="effort">by effort</option></select></label>
+  __SORT__
   <button type="button" class="lnk" id="lfClear">clear</button>
 </div>"""
+
+# The grid sorts from its column headers, so it doesn't carry this — two controls
+# for one action is how they end up disagreeing. Epic pages are lists, with no
+# headers to click, and keep it.
+_SORT_SELECT = """<label class="sortlab">sort <select id="lfSort" class="sortsel">
+    <option value="">default</option><option value="newest">newest first</option>
+    <option value="oldest">oldest first</option><option value="risk">by risk</option>
+    <option value="priority">by priority</option>
+    <option value="effort">by effort</option></select></label>"""
+
+
+def list_filter_bar(sort_select=True):
+    return LIST_FILTER_BAR.replace("__SORT__", _SORT_SELECT if sort_select else "")
 
 LIST_FILTER_SCRIPT = """<script>
 (function(){
@@ -1615,46 +1718,102 @@ LIST_FILTER_SCRIPT = """<script>
     uls.push({ul:ul,orig:Array.prototype.slice.call(ul.children).filter(
       function(n){return n.tagName==='LI';})});
   });
-  function attrKey(li,mode){
-    if(mode==='risk'){var r=RISK_ORD[li.getAttribute('data-risk')];return r==null?9:r;}
-    if(mode==='priority'){return parseInt(li.getAttribute('data-prio'),10)||9;}
-    var h=li.getAttribute('data-effh');
-    return (h===''||h==null)?1e9:parseFloat(h);
+  var STATUS_ORD={open:0,closed:1,wf:2};
+  /* One key per sortable column. A key is a value plus whether it is missing:
+     an unestimated ticket has no effort, and it should sink to the bottom in
+     BOTH directions rather than lead the list when you reverse it. Values are
+     numbers where the column is a quantity (id, priority, effort, date) and
+     strings where it is words (title, epic) — the comparator handles either,
+     which the old subtract-everything one could not. A date carries the ticket
+     number in its low digits, because a dozen tickets share a busy day and the
+     id is the only thing that says which of them came last. */
+  function key(li,col){
+    var v;
+    if(col==='risk')          v=RISK_ORD[li.getAttribute('data-risk')];
+    else if(col==='status')   v=STATUS_ORD[li.getAttribute('data-status')];
+    else if(col==='prio')     v=parseInt(li.getAttribute('data-prio'),10);
+    else if(col==='num')      v=parseInt(li.getAttribute('data-num'),10);
+    else if(col==='effh'){    var h=li.getAttribute('data-effh');
+                              v=(h===''||h==null)?null:parseFloat(h);}
+    else if(col==='date'){    var d=(li.getAttribute('data-date')||'').replace(/-/g,'');
+                              v=d?parseInt(d,10)*1e6+(parseInt(li.getAttribute('data-num'),10)||0):null;}
+    else                      v=li.getAttribute('data-'+col)||'';   /* title, epic */
+    var missing=(v==null||v===''||(typeof v==='number'&&isNaN(v)));
+    return {v:v,missing:missing};
   }
-  function liKey(li,mode){
-    if(li.hasAttribute('data-id'))return attrKey(li,mode);
-    var best=1e18; // .fam container: best value of its members
-    li.querySelectorAll('li[data-id]').forEach(function(x){
-      var k=attrKey(x,mode);if(k<best)best=k;});
-    return best;
+  function cmp(a,b){
+    if(a.missing||b.missing)return a.missing&&b.missing?0:(a.missing?1:-1);
+    if(typeof a.v==='number'&&typeof b.v==='number')return a.v-b.v;
+    return String(a.v).localeCompare(String(b.v));
   }
+  /* A group is a parent plus its sub-tickets, and it moves as one — keyed by the
+     parent (which leads it), so a family lands where its parent belongs. */
+  function groupKey(g,col){
+    for(var i=0;i<g.length;i++)if(g[i].hasAttribute('data-id'))return key(g[i],col);
+    return {v:'',missing:true};
+  }
+  var sortCol='',sortDir=1;
   function applySort(){
-    var mode=srt.value;
     uls.forEach(function(u){
       var groups=[],cur=null;
       u.orig.forEach(function(li){
-        var fam=!li.hasAttribute('data-id');
-        if(fam||!li.classList.contains('child')||!cur){cur=[];groups.push(cur);}
+        if(!li.classList.contains('child')||!cur){cur=[];groups.push(cur);}
         cur.push(li);
-        if(fam)cur=null;
       });
-      if(mode){
+      if(sortCol){
         groups=groups.slice().sort(function(a,b){
-          var ka=Math.min.apply(null,a.map(function(li){return liKey(li,mode);}));
-          var kb=Math.min.apply(null,b.map(function(li){return liKey(li,mode);}));
-          return ka-kb;
+          var d=cmp(groupKey(a,sortCol),groupKey(b,sortCol));
+          /* missing always sinks: never flip it with the direction */
+          if(groupKey(a,sortCol).missing!==groupKey(b,sortCol).missing)return d;
+          return d*sortDir;
         });
       }
       groups.forEach(function(g){g.forEach(function(li){u.ul.appendChild(li);});});
     });
   }
-  srt.addEventListener('change',applySort);
+  /* Column headers ARE the sort control on the grid. First click orders the way
+     the column is usually read — newest/highest/most-urgent first, text A→Z —
+     and a second click reverses it. */
+  var DESC_FIRST={num:1,date:1};
+  var heads=[].slice.call(document.querySelectorAll('.g-head [data-sort]'));
+  function markHeads(){
+    heads.forEach(function(h){
+      var col=h.getAttribute('data-sort'),on=col===sortCol;
+      h.classList.toggle('sorted',on);
+      /* inactive headers carry the direction their FIRST click would apply, so
+         the arrow that ghosts in on hover isn't lying about what you'd get */
+      h.setAttribute('data-dir',String(on?sortDir:(DESC_FIRST[col]?-1:1)));
+      h.setAttribute('aria-sort',on?(sortDir<0?'descending':'ascending'):'none');
+    });
+  }
+  function sortBy(col){
+    if(col===sortCol)sortDir=-sortDir;
+    else{sortCol=col;sortDir=DESC_FIRST[col]?-1:1;}
+    markHeads();applySort();
+  }
+  heads.forEach(function(h){
+    h.addEventListener('click',function(){sortBy(h.getAttribute('data-sort'));});
+    h.addEventListener('keydown',function(ev){
+      if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();sortBy(h.getAttribute('data-sort'));}
+    });
+  });
+  if(heads.length){sortCol='date';sortDir=-1;markHeads();}  /* as the server sent it */
+  /* Epic pages keep the dropdown — they are lists, and have no headers to click. */
+  if(srt)srt.addEventListener('change',function(){
+    var v=srt.value;
+    if(!v){sortCol='';}
+    else if(v==='newest'){sortCol='date';sortDir=-1;}
+    else if(v==='oldest'){sortCol='date';sortDir=1;}
+    else{sortCol=({risk:'risk',priority:'prio',effort:'effh'})[v];sortDir=1;}
+    markHeads();applySort();
+  });
   [q,risk,prio,eff,blk].forEach(function(el){
     el.addEventListener('input',apply);el.addEventListener('change',apply);});
   q.addEventListener('keydown',function(e){if(e.key==='Escape'){q.value='';apply();}});
   document.getElementById('lfClear').addEventListener('click',function(){
     q.value='';risk.value='';prio.value='';eff.value='';blk.value='';
-    srt.value='';applySort();apply();});
+    if(srt)srt.value='';
+    sortCol=heads.length?'date':'';sortDir=-1;markHeads();applySort();apply();});
   // epic chips sit inside ticket links; intercept and route to the epic page
   document.addEventListener('click',function(ev){
     var ch=ev.target.closest('.mchip[data-epic]');if(!ch)return;
@@ -1665,14 +1824,24 @@ LIST_FILTER_SCRIPT = """<script>
     var ch=ev.target&&ev.target.closest?ev.target.closest('.mchip[data-epic]'):null;
     if(!ch)return;ev.preventDefault();
     location.href='/epic/'+ch.getAttribute('data-epic');});
-  // pinned chips unpin in place (they sit inside ticket links)
-  document.addEventListener('click',function(ev){
-    var ch=ev.target.closest('.mchip.pinned[data-unpin]');if(!ch)return;
-    ev.preventDefault();ev.stopPropagation();
+  // pin chips toggle in place (they sit inside ticket links, so swallow the nav)
+  function setPin(ch,tid,pinned){
+    ch.style.pointerEvents='none';
     fetch('/api/pin',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({id:ch.getAttribute('data-unpin'),pinned:false})})
-      .then(function(){location.reload();});
-  },true);
+      body:JSON.stringify({id:tid,pinned:pinned})})
+      .then(function(){location.reload();})
+      .catch(function(){ch.style.pointerEvents='';ch.title='pin failed — server down?';});
+  }
+  function pinFromEvent(ev){
+    var ch=ev.target.closest&&ev.target.closest('.mchip[data-pin],.mchip[data-unpin]');
+    if(!ch)return;
+    ev.preventDefault();ev.stopPropagation();
+    var add=ch.hasAttribute('data-pin');
+    setPin(ch,ch.getAttribute(add?'data-pin':'data-unpin'),add);
+  }
+  document.addEventListener('click',pinFromEvent,true);
+  document.addEventListener('keydown',function(ev){
+    if(ev.key==='Enter'||ev.key===' ')pinFromEvent(ev);},true);
 })();
 </script>"""
 
@@ -1693,8 +1862,15 @@ def _epic_group(items, datekey, reverse):
             return "" if reverse else "9999-99-99"
         return max(ds) if reverse else min(ds)
 
+    def gkey(root):
+        # Dates are coarse — a busy day gives a dozen tickets the same date, and
+        # then the id is the only thing that says which came last. Tie-break on
+        # the number, in whichever direction the date is already going.
+        m = _IDRE["ticket_split"].match(root)
+        return (gdate(root), int(m.group(1)) if m else 0)
+
     out = []
-    for root in sorted(groups, key=gdate, reverse=reverse):
+    for root in sorted(groups, key=gkey, reverse=reverse):
         g = sorted(groups[root], key=lambda t: t["id"])
         for t in g:
             out.append((t, len(g) > 1 and bool(SUB_ID_RE.match(t["id"]))))
@@ -1720,8 +1896,7 @@ def _epic_ticket_li(t, is_child, datekey, today, show_epic=False):
     if t.get("wip"):
         chips += ('<span class="mchip wip" title="file modified in the git'
                   ' working tree">WIP</span>')
-    if t.get("pinned"):
-        chips += _pin_chip(t["id"])
+    chips += _pin_chip(t["id"], bool(t.get("pinned")))
     date = t.get(datekey) or ""
     dlab = date
     if datekey == "created" and date:
@@ -1731,26 +1906,102 @@ def _epic_ticket_li(t, is_child, datekey, today, show_epic=False):
     return ('<li class="%s"%s><a href="/ticket/%s"%s>'
             '<span class="tk-id">%s</span><span class="tk-ttl">%s</span>'
             '<span class="tk-meta">%s%s</span></a></li>' % (
-                "child" if is_child else "", _li_attrs(t), html.escape(t["id"]), _a_data(t),
+                "child" if is_child else "", _li_attrs(t, date), html.escape(t["id"]), _a_data(t),
                 html.escape(t["id"]), html.escape(t["title"]), chips,
                 ('<span class="tk-date">%s</span>' % html.escape(dlab)) if dlab else ""))
 
 
-def _pin_chip(tid):
-    return ('<span class="mchip pinned" role="button" tabindex="0" data-unpin="%s"'
-            ' title="pinned — click to unpin">&#128278;</span>'
-            % html.escape(tid))
+def pocket_html():
+    """The created/closed badge. Rendered hidden; whoever has the counts calls
+    ifcPocket() to fill it — the dashboard from the board it already fetched,
+    every other page from /api/pocket."""
+    return (
+        "<span class='today-pocket' id='todayPocket' hidden>"
+        "<button class='tp-lab' id='tp-win' type='button'"
+        " title='Switch window: today / 7 days / 30 days'>today</button>"
+        "<a class='tp-item tp-new' id='tp-new-a' href='/filter?created=today'>"
+        "<b id='tp-new'>0</b> created</a>"
+        "<a class='tp-item tp-done' id='tp-done-a'"
+        " href='/filter?closed=today&status=closed'><b id='tp-done'>0</b> closed</a>"
+        "</span>")
 
 
-def _li_attrs(t):
-    """data-* attributes the shared client-side filter/sort script reads."""
-    return (' data-id="%s" data-risk="%s" data-prio="%s" data-eff="%s"'
-            ' data-effh="%s" data-blocked="%s" data-search="%s"' % (
-                html.escape(t["id"]), html.escape(t.get("risk") or ""),
+# One pocket, one behaviour, wherever it is rendered: fill the counts, cycle the
+# window on click (remembered across pages), and keep both links pointing at the
+# view the numbers came from. The windows come from the server, so the badge and
+# the page behind it can't disagree about what "7 days" means.
+_POCKET_JS = """
+window.ifcPocket=function(counts){
+  var pocket=document.getElementById('todayPocket');
+  if(!pocket||!counts)return;
+  var WINS=__POCKET_WINDOWS__,
+      lab=document.getElementById('tp-win'),
+      LS_KEY='ifcTodayWin';
+  function show(key){
+    var w=WINS.filter(function(x){return x.key===key;})[0]||WINS[0],
+        c=counts[w.key]||{created:0,closed:0};
+    lab.textContent=w.lab;
+    document.getElementById('tp-new').textContent=c.created;
+    document.getElementById('tp-done').textContent=c.closed;
+    document.getElementById('tp-new-a').href='/filter?created='+w.key
+      +'&label='+encodeURIComponent('Created — '+w.lab);
+    document.getElementById('tp-done-a').href='/filter?closed='+w.key
+      +'&status=closed&label='+encodeURIComponent('Closed — '+w.lab);
+    try{localStorage.setItem(LS_KEY,w.key);}catch(e){}
+  }
+  if(!lab.getAttribute('data-wired')){
+    lab.setAttribute('data-wired','1');
+    lab.addEventListener('click',function(){
+      var cur='today';
+      try{cur=localStorage.getItem(LS_KEY)||'today';}catch(e){}
+      var i=WINS.map(function(w){return w.key;}).indexOf(cur);
+      show(WINS[(i+1)%WINS.length].key);
+    });
+  }
+  var saved='today';
+  try{saved=localStorage.getItem(LS_KEY)||'today';}catch(e){}
+  show(saved);
+  pocket.hidden=false;
+};
+"""
+
+
+def pocket_js():
+    wins = [{"key": k, "lab": lab} for k, _d, lab in POCKET_WINDOWS]
+    return _POCKET_JS.replace("__POCKET_WINDOWS__", json.dumps(wins))
+
+
+def _pin_chip(tid, pinned):
+    """Pin/unpin from any list. Pinned reads at a glance (🔖, always visible);
+    unpinned is a quiet 📌 that surfaces on hover — pinning is the action you
+    want while scanning, and it shouldn't shout at you from every row."""
+    if pinned:
+        return ('<span class="mchip pinned" role="button" tabindex="0"'
+                ' data-unpin="%s" title="pinned — click to unpin">&#128278;</span>'
+                % html.escape(tid))
+    return ('<span class="mchip pin-add" role="button" tabindex="0" data-pin="%s"'
+            ' title="pin this ticket">&#128204;</span>' % html.escape(tid))
+
+
+def _li_attrs(t, date=""):
+    """data-* attributes the shared client-side filter/sort script reads.
+
+    One per sortable column, so a header click has something to order by:
+    `date` is whichever date the column is about (created for open, closed for
+    closed — "newest first" then means what the heading says), `num` breaks the
+    ties a same-day date can't, and title/epic/status carry the text columns."""
+    m = _IDRE["ticket_split"].match(t["id"])
+    return (' data-id="%s" data-num="%s" data-title="%s" data-epic="%s"'
+            ' data-status="%s" data-risk="%s" data-prio="%s" data-eff="%s"'
+            ' data-effh="%s" data-blocked="%s" data-date="%s" data-search="%s"' % (
+                html.escape(t["id"]), m.group(1) if m else "",
+                html.escape(t["title"].lower()), html.escape(t.get("epic") or ""),
+                html.escape(t.get("status") or ""),
+                html.escape(t.get("risk") or ""),
                 html.escape(str(t.get("priority") or "")),
                 _effort_bucket(t.get("effortH")),
                 "" if t.get("effortH") is None else ("%g" % t["effortH"]),
-                "y" if t.get("blocked") else "n",
+                "y" if t.get("blocked") else "n", html.escape(date),
                 html.escape((t["id"] + " " + t["title"]).lower())))
 
 
@@ -1764,90 +2015,111 @@ def _a_data(t):
                 e(t.get("priority")), e(t.get("risk")), e(t.get("effort"))))
 
 
-def _ticket_card(t, is_child, datekey, today, show_epic=True):
-    """Roomier card rendering of one ticket, same data-* contract as the li."""
-    chips = ""
-    if show_epic and t.get("epic"):
-        ec = html.escape(t["epic"])
-        emo = EPIC_EMOJI.get(t["epic"], "")
-        chips += ('<span class="mchip epic-link" role="link" tabindex="0" data-epic="%s"'
-                  ' title="open the __PFX__-%s epic page">%s__PFX__-%s</span>'
-                  % (ec, ec, (emo + " ") if emo else "", ec))
-    if t.get("risk"):
-        chips += ('<span class="mchip r-%s">%s risk</span>'
-                  % (t["risk"].lower(), t["risk"].lower()))
-    if t.get("priority"):
-        chips += '<span class="mchip">P%s</span>' % html.escape(str(t["priority"]))
-    if t.get("effort"):
-        chips += '<span class="mchip">%s</span>' % html.escape(t["effort"])
-    if t.get("blocked"):
-        chips += '<span class="mchip blocked">blocked</span>'
-    if t.get("unblocks"):
-        chips += '<span class="mchip unblocks">unblocks %d</span>' % t["unblocks"]
-    if t.get("wip"):
-        chips += ('<span class="mchip wip" title="file modified in the git'
-                  ' working tree">WIP</span>')
-    if t.get("pinned"):
-        chips += _pin_chip(t["id"])
+_STATUS_LABEL = {"open": "OPEN", "closed": "CLOSED", "wf": "WON'T FIX"}
+
+
+def _grid_row(t, is_child, datekey, today, show_status):
+    """One ticket as a row of cells. Same `data-*` contract and same
+    `li > a` shape as the list rows, so the shared toolbar (search, filters,
+    sort, copy-ids, CSV) and the pin handler all keep working as they are."""
     date = t.get(datekey) or ""
-    dlab = date
+    age = ""
     if datekey == "created" and date:
         d = parse_date(date)
         if d:
-            dlab = "created %s · %dd old" % (date, (today - d).days)
-    elif date:
-        dlab = "closed %s" % date
-    sub = ""
-    m = SUB_ID_RE.match(t["id"])
-    if is_child and m:
-        sub = ('<span class="card-sub">&#8627; sub-ticket of %s</span>'
-               % html.escape(m.group(1)))
-    return ('<li class="%s"%s><a href="/ticket/%s"%s>'
-            '<span class="card-top"><span class="tk-id">%s</span>%s</span>'
-            '<span class="card-ttl">%s</span>%s'
-            '<span class="card-meta">%s</span></a></li>' % (
-                "child" if is_child else "", _li_attrs(t), html.escape(t["id"]), _a_data(t),
-                html.escape(t["id"]),
-                ('<span class="tk-date">%s</span>' % html.escape(dlab)) if dlab else "",
-                html.escape(t["title"]), sub, chips))
+            age = '<span class="g-age">%dd</span>' % (today - d).days
+    cells = [
+        '<span class="g-id">%s%s</span>' % (
+            '<span class="g-sub" title="sub-ticket">&#8627;</span>' if is_child else "",
+            html.escape(t["id"])),
+        '<span class="g-ttl">%s</span>' % html.escape(t["title"]),
+        ('<span class="g-epic"><span class="mchip epic-link" role="link"'
+         ' tabindex="0" data-epic="%s" title="open the __PFX__-%s epic page">'
+         '%s</span></span>' % (html.escape(t.get("epic", "")),
+                               html.escape(t.get("epic", "")),
+                               html.escape(t.get("epic", "") or "—"))),
+    ]
+    if show_status:
+        st = t.get("status", "")
+        cells.append('<span class="g-st st-%s">%s</span>'
+                     % (st, _STATUS_LABEL.get(st, st)))
+    cells += [
+        '<span class="g-p">%s</span>' % (
+            "P%s" % html.escape(str(t["priority"])) if t.get("priority") else "—"),
+        '<span class="g-risk r-%s">%s</span>' % (
+            (t.get("risk") or "none").lower(), html.escape(t.get("risk") or "—")),
+        '<span class="g-eff">%s</span>' % html.escape(t.get("effort") or "—"),
+        '<span class="g-date">%s%s</span>' % (html.escape(date or "—"), age),
+        '<span class="g-flags">%s%s%s</span>' % (
+            '<span class="mchip blocked" title="blocked">&#9940;</span>'
+            if t.get("blocked") else "",
+            '<span class="mchip wip" title="modified in the working tree">WIP</span>'
+            if t.get("wip") else "",
+            _pin_chip(t["id"], bool(t.get("pinned")))),
+    ]
+    return ('<li%s><a class="g-row" href="/ticket/%s"%s>%s</a></li>'
+            % (_li_attrs(t, date), html.escape(t["id"]), _a_data(t),
+               "".join(cells)))
 
 
-def _card_groups(items, datekey, reverse):
-    """[(ticket, is_child)] regrouped into per-root lists, order preserved."""
-    out, cur_root = [], None
-    for t, child in _epic_group(items, datekey, reverse):
-        m = SUB_ID_RE.match(t["id"])
-        root = m.group(1) if m else t["id"]
-        if root != cur_root:
-            out.append([])
-            cur_root = root
-        out[-1].append((t, child))
-    return out
+def _ticket_grid(items, datekey, today, show_status):
+    """The one filtered view: a row per ticket, cells in real columns.
+
+    The column template lives in a CSS variable on the <ul>, and the header row
+    and every ticket row inherit it — so they cannot drift out of alignment. Each
+    heading is the column's sort control (`data-sort` names the `data-*` the
+    script orders by), which is the only thing a column header has ever meant."""
+    # (css class, width, heading, sort key) — the header cells carry the same
+    # classes as the row cells, so a column that steps aside on a narrow screen
+    # takes its heading with it.
+    cells = [("g-id", "96px", "ID", "num"),
+             ("g-ttl", "minmax(0,1fr)", "TITLE", "title"),
+             ("g-epic", "78px", "EPIC", "epic")]
+    if show_status:
+        cells.append(("g-st", "82px", "STATUS", "status"))
+    cells += [("g-p", "38px", "P", "prio"),
+              ("g-risk", "58px", "RISK", "risk"),
+              ("g-eff", "58px", "EFFORT", "effh"),
+              ("g-date", "116px", "CLOSED" if datekey == "closed" else "CREATED",
+               "date"),
+              ("g-flags", "62px", "", "")]
+
+    rows = "".join(_grid_row(t, child, datekey, today, show_status)
+                   for t, child in _epic_group(items, datekey, True))
+    if not rows:
+        return '<div class="col"><div class="empty">no tickets match</div></div>'
+    head = ""
+    for cls, _w, label, key in cells:
+        if not key:
+            head += '<span class="%s"></span>' % cls
+            continue
+        # The server sorted by date, descending — say so, so the grid arrives
+        # already telling you how it is ordered.
+        active = ' data-dir="-1"' if key == "date" else ""
+        head += ('<span class="%s gh-sort" role="button" tabindex="0"'
+                 ' data-sort="%s"%s title="Sort by %s">%s'
+                 '<span class="gh-arrow" aria-hidden="true"></span></span>'
+                 % (cls, key, active, label.lower() or key, label))
+    tpl = "--gcols:%s" % " ".join(w for _c, w, _h, _k in cells)
+    return ('<div class="col col-grid"><div class="col-h"><span>%d ticket%s</span>'
+            '<span class="ch-r"><span class="cnt">%d</span>%s</span></div>'
+            '<div class="g-head" style="%s">%s</div>'
+            '<ul id="lst-grid" class="grid" style="%s">%s</ul></div>'
+            % (len(items), "" if len(items) == 1 else "s", len(items),
+               _list_tools("#lst-grid", "grid"), tpl, head, tpl, rows))
 
 
-def _status_col(kind, label, items, datekey, reverse, today, show_epic=False,
-                cards=False):
-    if cards:
-        # Compound families (parent + EM-####-X subs) share one joined card
-        # so the relationship stays visible in the grid.
-        parts = []
-        for g in _card_groups(items, datekey, reverse):
-            if len(g) == 1:
-                parts.append(_ticket_card(g[0][0], False, datekey, today, show_epic))
-            else:
-                parts.append('<li class="fam"><ul>' + "".join(
-                    _ticket_card(t, c, datekey, today, show_epic)
-                    for t, c in g) + "</ul></li>")
-        lis = "".join(parts)
-    else:
-        lis = "".join(_epic_ticket_li(t, c, datekey, today, show_epic)
-                      for t, c in _epic_group(items, datekey, reverse))
+def _status_col(kind, label, items, datekey, reverse, today, show_epic=False):
+    """A status column on the epic page — where you browse one epic's tickets.
+    The filtered view has its own shape (_ticket_grid); this stays a list."""
+    lis = "".join(_epic_ticket_li(t, c, datekey, today, show_epic)
+                  for t, c in _epic_group(items, datekey, reverse))
     lid = "lst-" + kind
     body = ('<ul id="%s">' % lid) + lis + "</ul>" if lis else '<div class="empty">none</div>'
     tools = _list_tools("#" + lid, kind) if lis else ""
-    return ('<div class="col col-%s%s"><div class="col-h"><span>%s</span>'
+    return ('<div class="col col-%s"><div class="col-h"><span>%s</span>'
             '<span class="ch-r"><span class="cnt">%d</span>%s</span></div>%s</div>'
-            % (kind, " cards" if cards else "", label, len(items), tools, body))
+            % (kind, label, len(items), tools, body))
 
 
 def render_epic_page(ep):
@@ -1918,7 +2190,7 @@ def render_epic_page(ep):
         + (("<span>last closed <b>" + html.escape(ep["lastClosed"]) + "</b></span>")
            if ep["lastClosed"] else "")
         + "</div></div>"
-        + LIST_FILTER_BAR
+        + list_filter_bar()
         # status groups stack full-width: open first, then closed, then won't-fix
         + "<div class='cols' style='grid-template-columns:1fr'>"
         + "".join(cols)
@@ -1930,6 +2202,68 @@ def render_epic_page(ep):
 # --------------------------------------------------------------------------- #
 # Filtered ticket-list page (/filter?...)
 # --------------------------------------------------------------------------- #
+# The grid: one row per ticket, cells in real columns. The template lives in
+# --gcols on the <ul> and is inherited by the header and every row, so the two
+# can't drift apart. Rows stay <li><a> so the shared toolbar and the pin handler
+# work here unchanged.
+GRID_CSS = """
+.wrap{max-width:1400px}
+/* Every row rule is scoped to .col-grid — the epic page's `.col li a` (one class,
+   two elements) out-specifies a bare `.g-row`, and it says display:flex. Without
+   this the cells lay out as a wrapping flex line and nothing sits under its
+   header, which is the whole point of the grid. Same reason the child indent has
+   to be undone: a shifted row is a row whose cells no longer line up. */
+.col-grid .g-head,.col-grid .g-row{display:grid;grid-template-columns:var(--gcols);
+gap:10px;align-items:center;padding:9px 14px}
+.col-grid .g-head{border-bottom:1px solid var(--line);font-family:var(--mono);
+font-size:.58rem;letter-spacing:.1em;color:var(--mut);text-transform:uppercase}
+.col-grid ul{list-style:none;margin:0;padding:0}
+.col-grid li{border-bottom:1px solid var(--line-2,var(--line))}
+.col-grid li:last-child{border-bottom:0}
+.col-grid li.child a.g-row{margin-left:0;border-left:0;border-radius:0}
+.col-grid .g-row{text-decoration:none;color:inherit;border-radius:0}
+.col-grid .g-row:hover{background:var(--surface2)}
+.col-grid .g-id{font-family:var(--mono);font-size:.74rem;color:var(--accent);white-space:nowrap}
+.col-grid .g-sub{color:var(--mut);margin-right:3px}
+.col-grid .g-ttl{font-size:.86rem;color:var(--ink);overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap}
+.col-grid .g-epic{overflow:hidden}
+.col-grid .g-epic .mchip{cursor:pointer}
+.col-grid .g-st{font-family:var(--mono);font-size:.56rem;letter-spacing:.06em;
+text-align:center;border-radius:4px;padding:3px 0;white-space:nowrap}
+/* the soft tints are mixed from the theme's own colours — this page has no
+   --*-soft tokens (those are the dashboard's), and hardcoding them would break
+   the moment you switch palette */
+.col-grid .g-st.st-open{color:var(--accent);
+background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.col-grid .g-st.st-closed{color:var(--done);
+background:color-mix(in srgb,var(--done) 14%,transparent)}
+.col-grid .g-st.st-wf{color:var(--wf);
+background:color-mix(in srgb,var(--wf) 16%,transparent)}
+.col-grid .g-p,.col-grid .g-risk,.col-grid .g-eff,.col-grid .g-date{
+font-family:var(--mono);font-size:.68rem;color:var(--mut);white-space:nowrap}
+.col-grid .g-risk.r-high{color:#c23b3b;font-weight:600}
+.col-grid .g-risk.r-medium{color:var(--warn)}
+.col-grid .g-age{opacity:.65;margin-left:6px}
+.col-grid .g-flags{display:flex;gap:4px;justify-content:flex-end;align-items:center}
+/* headings borrow the row's classes so they hide together — but not its looks */
+.col-grid .g-head span{color:var(--mut);background:none;font:inherit;text-align:left;
+padding:0;opacity:1}
+/* a header is a sort control: it says what the column is, and orders by it */
+.col-grid .gh-sort{cursor:pointer;user-select:none;display:inline-flex;align-items:center;gap:3px}
+.col-grid .gh-sort:hover,.col-grid .gh-sort:focus-visible{color:var(--accent)}
+.col-grid .gh-sort.sorted{color:var(--accent);font-weight:700}
+.col-grid .gh-arrow{font-size:.8em;opacity:0}
+.col-grid .gh-sort:hover .gh-arrow{opacity:.45}
+.col-grid .gh-sort.sorted .gh-arrow{opacity:1}
+.col-grid .gh-sort .gh-arrow::before{content:"\\2191"}                 /* ascending */
+.col-grid .gh-sort[data-dir="-1"] .gh-arrow::before{content:"\\2193"}  /* descending */
+/* narrow: the nice-to-have columns step aside; id, title and the date never do */
+@media (max-width:1000px){
+  .col-grid .g-head,.col-grid .g-row{grid-template-columns:92px minmax(0,1fr) 96px 52px}
+  .col-grid .g-epic,.col-grid .g-st,.col-grid .g-p,.col-grid .g-risk,.col-grid .g-eff{display:none}
+}
+"""
 def render_filter_page(data, q):
     """Cross-epic ticket list for a metric click-through.
 
@@ -1951,9 +2285,9 @@ def render_filter_page(data, q):
     stale = int(qv("stale")) if qv("stale").isdigit() else None
     c_from, c_to = parse_date(qv("closed_from")), parse_date(qv("closed_to"))
     n_from, n_to = parse_date(qv("created_from")), parse_date(qv("created_to"))
-    # Shorthands for static links (the header "today" pocket): the server
-    # knows the date. week/month are rolling windows, matching the pocket.
-    windows = {"today": 0, "week": 6, "month": 29}
+    # Shorthands for static links (the top bar's pocket): the server knows the
+    # date, and POCKET_WINDOWS is the same table the badge counted with.
+    windows = {k: d for k, d, _ in POCKET_WINDOWS}
     if qv("created") in windows:
         n_from, n_to = today - datetime.timedelta(days=windows[qv("created")]), today
     if qv("closed") in windows:
@@ -1992,31 +2326,24 @@ def render_filter_page(data, q):
                 return False
         return True
 
-    buckets = {"open": [], "closed": [], "wf": []}
+    # One list, whatever the query. Every arrival here asks the same thing —
+    # which tickets, and what are they — so there is one answer: a grid you read
+    # down. Status rides along as a cell, and only earns a column when the result
+    # actually mixes statuses.
+    rows = []
     for ep in data["epics"]:
-        buckets["open"].extend(t for t in ep["openTickets"] if keep("open", t))
-        buckets["closed"].extend(t for t in ep["closedTickets"] if keep("closed", t))
-        buckets["wf"].extend(t for t in ep["wfTickets"] if keep("wf", t))
+        for st, key in (("open", "openTickets"), ("closed", "closedTickets"),
+                        ("wf", "wfTickets")):
+            rows.extend(dict(t, status=st) for t in ep[key] if keep(st, t))
 
-    # One status selected -> roomier card grid; several -> status groups
-    # stacked full-width, open on top, then closed, then won't-fix.
-    cards = len(statuses) == 1
-    cols = []
-    if "open" in statuses and (buckets["open"] or statuses == {"open"}):
-        cols.append(_status_col("open", "Open — oldest first", buckets["open"],
-                                "created", False, today, show_epic=True,
-                                cards=cards))
-    if "closed" in statuses and (buckets["closed"] or statuses == {"closed"}):
-        cols.append(_status_col("closed", "Closed — newest first", buckets["closed"],
-                                "closed", True, today, show_epic=True,
-                                cards=cards))
-    if "wf" in statuses and (buckets["wf"] or statuses == {"wf"}):
-        cols.append(_status_col("wf", "Won't fix", buckets["wf"],
-                                "created", False, today, show_epic=True,
-                                cards=cards))
+    # Show the date the query is about: a closed window means you came here to
+    # see what got closed, so that is the date on the row.
+    datekey = "closed" if (c_from or c_to or statuses == {"closed"}) else "created"
+    show_status = len({t["status"] for t in rows}) > 1
+    grid = _ticket_grid(rows, datekey, today, show_status)
 
-    n = sum(len(v) for v in buckets.values())
-    eff_d = sum(t["effortH"] for v in buckets.values() for t in v
+    n = len(rows)
+    eff_d = sum(t["effortH"] for t in rows
                 if t.get("effortH") is not None) / 8
     crit = []
     if statuses != {"open", "closed", "wf"}:
@@ -2042,16 +2369,13 @@ def render_filter_page(data, q):
     if n_from or n_to:
         crit.append("created %s &rarr; %s" % (_iso(n_from) or "…", _iso(n_to) or "…"))
 
-    # Status groups always stack full-width; card pages use the whole viewport.
-    style = "grid-template-columns:1fr;"
-    extra_css = ".wrap{max-width:1500px}" if cards else ""
     page = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>" + html.escape(label) + " &middot; __BRAND__</title>"
         "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'"
         " viewBox='0 0 100 100'><text y='.9em' font-size='90'>__FAVICON__</text></svg>\">"
-        "<style>" + EPIC_CSS + extra_css + "</style></head><body><div class='wrap'>"
+        "<style>" + EPIC_CSS + GRID_CSS + "</style></head><body><div class='wrap'>"
         "<a class='back' href='/'>&larr; back to dashboard</a>"
         "<div class='ehead'>"
         "<div class='tid'>FILTERED VIEW</div>"
@@ -2061,10 +2385,9 @@ def render_filter_page(data, q):
         "<span>effort <b>" + ("%g" % round(eff_d, 1)) + "d</b></span>"
         + "".join("<span>" + c + "</span>" for c in crit)
         + "</div></div>"
-        + LIST_FILTER_BAR
-        + "<div class='cols' style='" + style + "'>"
-        + ("".join(cols) or "<div class='col'><div class='empty'>no tickets match</div></div>")
-        + "</div></div>" + LIST_FILTER_SCRIPT + "</body></html>"
+        + list_filter_bar(sort_select=False)      # the grid's headers sort it
+        + "<div class='cols' style='grid-template-columns:1fr'>" + grid + "</div>"
+        + "</div>" + LIST_FILTER_SCRIPT + "</body></html>"
     )
     return page
 
@@ -2096,10 +2419,11 @@ DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 .head{background:var(--surface);border:1px solid var(--line);border-radius:calc(var(--r) + 3px);
 box-shadow:var(--shadow);padding:clamp(20px,3.5vw,34px);position:relative;overflow:hidden}
 .head-top{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px 20px;margin-top:6px}
-/* the "today" pocket: created/closed today, sitting between the eyebrow and
-   the header buttons — small on purpose */
+/* the "today" pocket: created/closed in the window, riding in the header's
+   button cluster. Same pill geometry as .ghbtn beside it — one row of controls,
+   one centre line, and nothing that drifts when the eyebrow changes length. */
 .today-pocket{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);
-border-radius:100px;padding:4px 12px;background:var(--surface)}
+border-radius:100px;padding:7px 14px;background:var(--surface-2);line-height:1;min-height:15px}
 .today-pocket .tp-lab{font-family:var(--font-mono);font-size:.62rem;letter-spacing:.09em;
 text-transform:uppercase;color:var(--ink-mut);border:0;background:none;padding:0;
 cursor:pointer}
@@ -2451,6 +2775,11 @@ border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color
 .np-it input[type=checkbox]{margin-top:2px;accent-color:var(--accent);width:15px;height:15px;flex:none;cursor:pointer}
 .np-it .t{flex:1;font-size:.84rem;line-height:1.45;word-break:break-word}
 .np-it.done .t{color:var(--ink-mut);text-decoration:line-through}
+.np-tid{font-family:var(--font-mono,ui-monospace,monospace);font-size:.78rem;color:var(--accent);
+  text-decoration:none;border-bottom:1px dotted currentColor;white-space:nowrap}
+.np-tid:hover{opacity:.72}
+.np-tid.done{color:var(--done)}
+.np-tid.done::after{content:" ✓"}
 .np-it .del{opacity:0}
 .np-it:hover .del,.np-it .del:focus-visible{opacity:1}
 .np-empty{font-size:.82rem;color:var(--ink-mut);padding:10px 9px;margin:0}
@@ -2547,12 +2876,8 @@ section.collapsed .sec-head{margin-bottom:0}
   <header class="head">
     <div class="head-top">
       <span class="eyebrow">__EYEBROW__</span>
-      <span class="today-pocket" id="todayPocket" hidden>
-        <button class="tp-lab" id="tp-win" type="button" title="Switch window: today / week / month">today</button>
-        <a class="tp-item tp-new" id="tp-new-a" href="/filter?created=today&label=Created%20today"><b id="tp-new">0</b> created</a>
-        <a class="tp-item tp-done" id="tp-done-a" href="/filter?closed=today&status=closed&label=Closed%20today"><b id="tp-done">0</b> closed</a>
-      </span>
       <span class="head-btns">
+        __POCKET__
         <a id="ghBtn" class="ghbtn" hidden target="_blank" rel="noopener">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
           GitHub <span class="gh-sub" id="ghSub"></span></a>
@@ -3316,47 +3641,9 @@ section.collapsed .sec-head{margin-bottom:0}
     var finishing=d.epics.filter(function(e){return e.open===1;}).length;
     document.getElementById("k-complete").textContent=complete;
     document.getElementById("k-complete-sub").textContent=finishing+" more at 1 open";
-    /* the "today" pocket — created/closed counts over a day/week/month
-       window (rolling, local time); clicking the label cycles the window */
-    function isoDay(dt){return dt.getFullYear()+"-"+("0"+(dt.getMonth()+1)).slice(-2)+"-"+("0"+dt.getDate()).slice(-2);}
-    var now=new Date(),
-        WINS=[{key:"today",lab:"today",days:0},
-              {key:"week",lab:"7 days",days:6},
-              {key:"month",lab:"30 days",days:29}],
-        counts={};
-    WINS.forEach(function(w){counts[w.key]={created:0,closed:0,
-      from:isoDay(new Date(now.getTime()-w.days*864e5))};});
-    d.epics.forEach(function(e){
-      [].concat(e.openTickets||[],e.closedTickets||[],e.wfTickets||[],e.standingTickets||[])
-        .forEach(function(x){
-          WINS.forEach(function(w){
-            if(x.created&&x.created>=counts[w.key].from)counts[w.key].created++;
-            if(x.closed&&x.closed>=counts[w.key].from)counts[w.key].closed++;});});
-    });
-    var tpWin=document.getElementById("tp-win");
-    function showWin(key){
-      var w=WINS.filter(function(x){return x.key===key;})[0]||WINS[0],c=counts[w.key];
-      tpWin.textContent=w.lab;
-      document.getElementById("tp-new").textContent=c.created;
-      document.getElementById("tp-done").textContent=c.closed;
-      document.getElementById("tp-new-a").href=
-        "/filter?created="+w.key+"&label="+encodeURIComponent("Created — "+w.lab);
-      document.getElementById("tp-done-a").href=
-        "/filter?closed="+w.key+"&status=closed&label="+encodeURIComponent("Closed — "+w.lab);
-      try{localStorage.setItem("ifcTodayWin",w.key);}catch(e){}
-    }
-    if(!tpWin.getAttribute("data-wired")){
-      tpWin.setAttribute("data-wired","1");
-      tpWin.addEventListener("click",function(){
-        var cur=localStorage.getItem("ifcTodayWin")||"today",
-            i=WINS.map(function(w){return w.key;}).indexOf(cur);
-        showWin(WINS[(i+1)%WINS.length].key);
-      });
-    }
-    var saved="today";
-    try{saved=localStorage.getItem("ifcTodayWin")||"today";}catch(e){}
-    showWin(saved);
-    document.getElementById("todayPocket").hidden=false;
+    /* the created/closed pocket — counted on the server (so it agrees with the
+       view it links to), rendered by the shared module wherever it now lives */
+    if(window.ifcPocket)window.ifcPocket(d.pocket);
   }
   function renderTracks(d){
     var complete=d.epics.filter(function(e){return e.open===0&&epTotal(e)>0;});
@@ -5504,6 +5791,27 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/prioritize", "/prioritize/"):   # ?p=&r= read client-side
             self._send(PRIORITIZE_HTML)
             return
+        if path == "/api/pocket":
+            # The bar's created/closed badge, on pages that never load the board.
+            try:
+                data, _ = scan()
+                self._send(json.dumps(data["pocket"]),
+                           "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(json.dumps({"error": str(exc)}),
+                           "application/json; charset=utf-8", code=500)
+            return
+        if path == "/api/ids":
+            # Just the id -> status/title index: the notes pop-out wants to chip
+            # the ticket ids in a captured item, not the whole board.
+            try:
+                data, _ = scan()
+                self._send(json.dumps(data["index"]),
+                           "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(json.dumps({"error": str(exc)}),
+                           "application/json; charset=utf-8", code=500)
+            return
         if path == "/api/data":
             try:
                 data, _ = scan()
@@ -5741,7 +6049,12 @@ class Handler(BaseHTTPRequestHandler):
                            "application/json; charset=utf-8", code=400)
                 return
             try:
-                rendered = md_to_html(content)
+                # A scratchpad block that became a ticket carries its id; link
+                # it, so the preview is a way through to the work it spawned.
+                data, id_index = scan()
+                rendered = autolink_ids(md_to_html(content), set(id_index),
+                                        {e["id"] for e in data["epics"]},
+                                        adr_index()[1])
             except Exception as exc:
                 self._send(json.dumps({"ok": False, "error": str(exc)}),
                            "application/json; charset=utf-8", code=500)
@@ -6325,6 +6638,13 @@ def _transform_html(s):
             for sr in doc_series()))
     if "__THEME_PICKER__" in s:
         s = s.replace("__THEME_PICKER__", render_theme_picker())
+    if "__POCKET__" in s:
+        s = s.replace("__POCKET__", pocket_html())
+    # Every page gets the pocket module — the dashboard fills it from the board
+    # it already fetched, the top bar from /api/pocket, and neither has to know
+    # where the badge ended up.
+    s = _BODY_OPEN_RE.sub(
+        lambda m: m.group(1) + "<script>" + pocket_js() + "</script>", s, count=1)
     if THEME_OVERRIDE_CSS:
         s = s.replace("</head>", "<style>" + THEME_OVERRIDE_CSS + "</style></head>", 1)
     s = s.replace("</body>", _FOOTER + "</body>", 1)
@@ -6684,9 +7004,26 @@ body{padding-top:52px}
 padding:8px 18px;background:var(--surface,#fff);border-bottom:1px solid var(--line,#e2e2e2);
 box-shadow:0 1px 3px rgba(0,0,0,.06)}
 #ifc-actions{margin-left:auto;display:flex;align-items:center;gap:8px}
-/* GitHub info sits dead-centre in the bar, independent of the left/right slots */
-#ifc-center{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;align-items:center}
+/* the pocket + GitHub sit dead-centre in the bar, independent of the left/right
+   slots — the same pair, in the same place, on every page */
+#ifc-center{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;align-items:center;gap:8px}
 #ifc-center:empty{display:none}
+/* 32px is the bar's one control height. Everything in the bar — GitHub, the
+   pocket, the link and notes buttons — is exactly that tall, so the row shares a
+   baseline instead of each control being whatever its padding made it. */
+#ifc-bar .today-pocket{display:inline-flex;align-items:center;gap:8px;line-height:1;
+height:32px;padding:0 13px;box-sizing:border-box;
+border:1px solid var(--line);border-radius:100px;background:var(--surface-2,transparent)}
+#ifc-bar .today-pocket[hidden]{display:none}
+#ifc-bar .tp-lab{font-family:var(--font-mono);font-size:.6rem;letter-spacing:.09em;text-transform:uppercase;
+color:var(--ink-mut);border:0;background:none;padding:0;cursor:pointer}
+#ifc-bar .tp-lab:hover{color:var(--accent-ink,var(--accent))}
+#ifc-bar .tp-item{font-family:var(--font-mono);font-size:.7rem;color:var(--ink-mut);text-decoration:none}
+#ifc-bar .tp-item b{font-weight:750;font-size:.8rem}
+#ifc-bar .tp-new b{color:var(--accent-ink,var(--accent))}
+#ifc-bar .tp-done b{color:var(--done)}
+#ifc-bar .tp-item:hover{color:var(--accent-ink,var(--accent))}
+@media (max-width:1100px){#ifc-center .today-pocket{display:none}}
 #ifc-switch{position:relative}
 .ifc-i{margin-left:6px;font-size:1.02em}
 /* trigger */
@@ -6758,7 +7095,8 @@ border-radius:8px;padding:5px 10px;box-shadow:var(--shadow,0 8px 24px rgba(0,0,0
 #ifc-bar .proj-link:hover .pl-tip,#ifc-bar .proj-link:focus-visible .pl-tip,
 #ifc-bar .notebtn:hover .pl-tip,#ifc-bar .notebtn:focus-visible .pl-tip{opacity:1;transform:translate(-50%,0)}
 #ifc-bar .ghbtn{display:inline-flex;align-items:center;gap:7px;font-family:var(--font-mono);font-size:.72rem;color:var(--ink);
-text-decoration:none;background:var(--surface-2);border:1px solid var(--line);border-radius:100px;padding:6px 12px;white-space:nowrap}
+text-decoration:none;background:var(--surface-2);border:1px solid var(--line);border-radius:100px;
+height:32px;padding:0 13px;box-sizing:border-box;white-space:nowrap}
 #ifc-bar .ghbtn:hover{border-color:var(--accent);background:var(--accent-soft);color:var(--accent-ink)}
 #ifc-bar .ghbtn svg{width:14px;height:14px;fill:currentColor;flex:none}
 /* the notes/to-do drawer, injected on non-dashboard pages */
@@ -6786,6 +7124,11 @@ border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color
 .np-it input[type=checkbox]{margin-top:2px;accent-color:var(--accent);width:15px;height:15px;flex:none;cursor:pointer}
 .np-it .t{flex:1;font-size:.84rem;line-height:1.45;word-break:break-word}
 .np-it.done .t{color:var(--ink-mut);text-decoration:line-through}
+.np-tid{font-family:var(--font-mono,ui-monospace,monospace);font-size:.78rem;color:var(--accent);
+  text-decoration:none;border-bottom:1px dotted currentColor;white-space:nowrap}
+.np-tid:hover{opacity:.72}
+.np-tid.done{color:var(--done)}
+.np-tid.done::after{content:" ✓"}
 .np-it .del{opacity:0;font-family:var(--font-mono);font-size:.66rem;border:1px solid var(--line);
 background:var(--surface-2);border-radius:5px;cursor:pointer;color:var(--ink-mut);padding:1px 6px}
 .np-it:hover .del,.np-it .del:focus-visible{opacity:1}
@@ -6876,13 +7219,20 @@ function relocate(){
    across from the eyebrow — so it and the icons read as swapped. */
 var acts=document.getElementById('ifc-actions');
 if(!acts)return;
-var gh=document.getElementById('ghBtn');
-var links=document.getElementById('projLinks');
-var notes=document.querySelector('.note-btns');
 var mid=document.getElementById('ifc-center');
-if(gh&&mid)mid.appendChild(gh);
-if(links)acts.appendChild(links);
-if(notes)acts.appendChild(notes);
+/* Move a control into its slot — but never touch one the bar already rendered
+   there. appendChild is a *move*: re-appending a sub-page's own pocket dragged
+   it to the end of the row, which is why the order differed from the board's.
+   Placement is stated, not left to whatever order the calls happen to run in. */
+function place(el,slot,first){
+  if(!el||!slot||slot.contains(el))return;
+  if(first&&slot.firstChild)slot.insertBefore(el,slot.firstChild);
+  else slot.appendChild(el);
+}
+place(document.getElementById('ghBtn'),mid);                 /* centre */
+place(document.getElementById('todayPocket'),acts,true);     /* right, leading */
+place(document.getElementById('projLinks'),acts);
+place(document.querySelector('.note-btns'),acts);
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',relocate);
 else relocate();
@@ -6973,11 +7323,39 @@ _NOTES_JS = r"""
     return list.length?list.map(function(i){return "- ["+(i.done?"x":" ")+"] "+i.text;}).join("\n")+"\n":"";
   }
   function content(){return cur==="todo"?serializeTodo(items):ta.value;}
+  /* A captured item carries the id of the ticket it became. Resolve it against
+     the board (fetched once, lazily) so the item shows what became of it and
+     clicks through — the note stores the id, never the status, so this can't go
+     stale. Only ids the board knows become links, so a link never 404s. */
+  var TID=/\b[A-Za-z][A-Za-z0-9]*-[\w.\-]*\d[\w.\-]*\b/g,IDX=null;
+  function loadIdx(){
+    if(IDX)return;
+    fetch("/api/ids",{cache:"no-store"}).then(function(r){return r.json();})
+      .then(function(j){IDX=(j&&!j.error)?j:{};if(cur==="todo")renderTodo();})
+      .catch(function(){IDX={};});
+  }
+  function tidLink(id){
+    var m=IDX[id],a=document.createElement("a");
+    a.className="np-tid"+(m.status==="OPEN"?"":" done");
+    a.href="/ticket/"+encodeURIComponent(id);a.textContent=id;
+    a.title=m.status+" · "+m.title;
+    return a;
+  }
+  function fillText(el,text){
+    el.textContent="";TID.lastIndex=0;
+    var last=0,m;
+    while((m=TID.exec(text))){
+      if(!IDX||!IDX[m[0]])continue;                    /* not a ticket we know */
+      if(m.index>last)el.appendChild(document.createTextNode(text.slice(last,m.index)));
+      el.appendChild(tidLink(m[0]));last=m.index+m[0].length;
+    }
+    if(last<text.length)el.appendChild(document.createTextNode(text.slice(last)));
+  }
   function todoRow(it){
     var d=document.createElement("div");d.className="np-it"+(it.done?" done":"");
     var cb=document.createElement("input");cb.type="checkbox";cb.checked=it.done;
     cb.addEventListener("change",function(){it.done=cb.checked;renderTodo();flush();});
-    var t=document.createElement("span");t.className="t";t.textContent=it.text;
+    var t=document.createElement("span");t.className="t";fillText(t,it.text);
     var del=document.createElement("button");del.type="button";del.className="pin-x del";
     del.textContent="✕";del.title="Delete";
     del.addEventListener("click",function(){items.splice(items.indexOf(it),1);renderTodo();flush();});
@@ -7015,7 +7393,7 @@ _NOTES_JS = r"""
     fetch("/api/note?which="+which).then(function(r){return r.json();}).then(function(j){
       if(cur!==which)return;
       var c=j.ok?j.content:"";loaded=c;setStatus(j.ok?"":"load failed");
-      if(which==="todo"){items=parseTodo(c);renderTodo();addIn.value="";addIn.focus();
+      if(which==="todo"){items=parseTodo(c);loadIdx();renderTodo();addIn.value="";addIn.focus();
         if(serializeTodo(items)!==c)flush();}
       else{ta.disabled=false;ta.value=c;ta.focus();}
     }).catch(function(){if(cur!==which)return;ta.disabled=false;setStatus("load failed — server down?");});
@@ -7064,8 +7442,9 @@ def _gh_link_html():
 
 
 def _persist_controls_html():
-    """(centre, right) markup for the bar on non-dashboard pages: GitHub centred,
-    then project links + the notes/to-do buttons on the right — so they follow you."""
+    """(centre, right) markup for the bar on non-dashboard pages: the pocket and
+    GitHub centred, then project links + the notes/to-do buttons on the right —
+    so the whole set follows you from page to page."""
     notes = ("<span class='note-btns'>"
              "<button class='notebtn nb-notes' type='button' data-which='scratch' aria-label='Open scratchpad'>"
              "<span class='pl-emo'>&#128221;</span><span class='pl-tip' role='tooltip'>Scratchpad</span></button>"
@@ -7073,7 +7452,9 @@ def _persist_controls_html():
              "<span class='pl-emo'>&#128204;</span><span class='pl-tip' role='tooltip'>To-do list</span></button>"
              "</span>")
     links = "<span class='proj-links'>" + _LINK_ADD_BTN + render_project_links() + "</span>"
-    return _gh_link_html(), links + notes
+    # The pocket is a pair of links into ticket lists — it belongs with the
+    # ticket controls on the right, not with GitHub. GitHub keeps the centre.
+    return _gh_link_html(), pocket_html() + links + notes
 
 
 def _switcher_html(is_dash=True):
@@ -7130,9 +7511,18 @@ def _switcher_html(is_dash=True):
         "</div>" + home
         + "<div id='ifc-center'>" + center + "</div>"
         + "<div id='ifc-actions'>" + actions + "</div></div>"
-        "<style>" + _SWITCHER_CSS + "</style><script>" + _SWITCHER_JS + "</script>"
+        "<style>" + _SWITCHER_CSS + "</style><script>" + _SWITCHER_JS
+        # The dashboard fills its pocket from the board payload it fetches
+        # anyway; every other page asks for just the counts.
+        + ("" if is_dash else _BAR_POCKET_JS) + "</script>"
     )
 
+
+_BAR_POCKET_JS = """
+fetch('/api/pocket',{cache:'no-store'}).then(function(r){return r.json();})
+  .then(function(j){if(window.ifcPocket&&j&&!j.error)window.ifcPocket(j);})
+  .catch(function(){});
+"""
 
 _BODY_OPEN_RE = re.compile(r"(<body[^>]*>)", re.I)
 

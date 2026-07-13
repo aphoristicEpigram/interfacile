@@ -55,5 +55,7 @@ The body carries three sections: **Context** (why), **Approach** (how), and
    statuses, dates, and the dependency graph. Run it after any hand edit.
 
 Agent skills for this flow live in `.claude/skills/` (`new-ticket`,
-`work-ticket`, `close-ticket`, `ticket-status`). Reinstall or update them any
+`work-ticket`, `close-ticket`, `ticket-status`, and `capture-ticket` — which
+turns a line from the to-do pop-out, or a block from the scratchpad, into a
+ticket, and points the note at what it became). Reinstall or update them any
 time with `interfacile skills`.

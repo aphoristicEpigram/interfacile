@@ -17,6 +17,8 @@
 
 The ticket flow (see `interfacile <cmd> -h`):
     new · tickets · ready · show · deps · close · lint
+    todo · scratch                    capture: the pop-out notes, and the
+                                      tickets they became
 
 Common serve flags: --port N  --host H  --no-open
 """

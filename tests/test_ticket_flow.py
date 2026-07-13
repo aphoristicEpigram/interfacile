@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
+from interfacile import server
 from interfacile import ticket
 
 
@@ -227,6 +228,188 @@ class TestLint(RepoCase):
         self.assertEqual(rc, 1)
         checks = {e["check"] for e in json.loads(out)["errors"]}
         self.assertIn("deps", checks)
+
+
+class TestTodo(RepoCase):
+    """`interfacile todo` — the on-ramp the capture-ticket skill drives."""
+
+    def setUp(self):
+        super(TestTodo, self).setUp()
+        self.path = os.path.join(self.root, ".interfacile", "todo.md")
+
+    def todo(self, action="list", n=None, **kw):
+        args = dict(repo=self.root, action=action, n=n, ticket=None,
+                    all=False, json=False)
+        args.update(kw)
+        return run(ticket.cmd_todo, **args)
+
+    def read(self):
+        with open(self.path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def seed(self, text="- [x] shipped\n- [ ] first\n- [ ] second\n"):
+        write(self.path, text)
+
+    def test_parse_and_serialize_round_trip(self):
+        text = "- [x] done one\n- [ ] open one\n"
+        self.assertEqual(server.serialize_todo(server.parse_todo(text)), text)
+
+    def test_parse_tolerates_bare_lines_and_normalises_them(self):
+        items = server.parse_todo("pasted line\n* [X] starred done\n\n- dashed\n")
+        self.assertEqual([i["done"] for i in items], [False, True, False])
+        self.assertEqual([i["text"] for i in items],
+                         ["pasted line", "starred done", "dashed"])
+        self.assertEqual(server.serialize_todo(items),
+                         "- [ ] pasted line\n- [x] starred done\n- [ ] dashed\n")
+
+    def test_list_hides_done_until_asked(self):
+        self.seed()
+        rc, out, _ = self.todo()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("shipped", out)
+        self.assertIn("first", out)
+        self.assertIn("2 open · 1 done", out)
+        self.assertIn("shipped", self.todo(all=True)[1])
+
+    def test_json_numbers_are_stable_across_done_items(self):
+        self.seed()
+        payload = json.loads(self.todo(json=True)[1])
+        self.assertEqual([i["n"] for i in payload], [2, 3])   # 1 is done
+        self.assertEqual(payload[0]["text"], "first")
+
+    def test_done_ticks_one_item_and_leaves_the_rest_alone(self):
+        self.seed()
+        rc, out, _ = self.todo("done", 2)
+        self.assertEqual(rc, 0)
+        self.assertIn("first", out)
+        self.assertEqual(self.read(), "- [x] shipped\n- [x] first\n- [ ] second\n")
+
+    def test_done_with_ticket_links_the_item_and_never_double_appends(self):
+        self.seed()
+        self.todo("done", 3, ticket="xx-0007")            # id is normalised
+        self.assertIn("- [x] second (XX-0007)\n", self.read())
+        rc, out, _ = self.todo("done", 3, ticket="XX-0007")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.read().count("XX-0007"), 1)
+        self.assertIn("•", out)                           # already done, no-op
+
+    def test_done_on_a_missing_item_fails_and_writes_nothing(self):
+        self.seed()
+        before = self.read()
+        self.assertEqual(self.todo("done", 9)[0], 1)
+        self.assertEqual(self.todo("done", 0)[0], 1)
+        self.assertEqual(self.todo("done")[0], 1)         # no number at all
+        self.assertEqual(self.read(), before)
+
+    def test_no_list_yet_is_not_an_error(self):
+        rc, out, _ = self.todo()
+        self.assertEqual(rc, 0)
+        self.assertIn("no to-do list yet", out)
+        self.assertEqual(json.loads(self.todo(json=True)[1]), [])
+
+    def test_a_second_ticket_extends_the_reference(self):
+        repo = ticket.Repo(self.root)
+
+        def link(text, tid):
+            return ticket.link_todo_text(repo, text, tid)
+
+        self.assertEqual(link("write the docs", "XX-0001"),
+                         "write the docs (XX-0001)")
+        self.assertEqual(link("write the docs (XX-0001)", "XX-0002"),
+                         "write the docs (XX-0001, XX-0002)")
+        self.assertEqual(link("write the docs (XX-0001, XX-0002)", "XX-0001"),
+                         "write the docs (XX-0001, XX-0002)")
+
+    def test_ids_follow_the_repo_scheme_not_a_guess(self):
+        """The prefix and width come from config — `AB-12` is not an id here."""
+        repo = ticket.Repo(self.root)                      # XX, 4 digits
+        self.assertEqual(repo.link_re.findall("XX-0001 and AB-12 and XX-9"),
+                         ["XX-0001"])
+
+
+class TestScratch(RepoCase):
+    """`interfacile scratch` — capture from prose, annotated never cut."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = os.path.join(self.root, ".interfacile", "scratchpad.md")
+        write(self.path, "# notes\n\nthe closed view is a mess\n"
+                         "needs grouping by epic\n\nask about the bill\n")
+
+    def scratch(self, action="list", n=None, **kw):
+        args = dict(repo=self.root, action=action, n=n, ticket=None, json=False)
+        args.update(kw)
+        return run(ticket.cmd_scratch, **args)
+
+    def read(self):
+        with open(self.path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_blocks_are_runs_of_non_blank_lines(self):
+        payload = json.loads(self.scratch(json=True)[1])
+        self.assertEqual([b["n"] for b in payload], [1, 2, 3])
+        self.assertEqual(payload[1]["text"],
+                         "the closed view is a mess\nneeds grouping by epic")
+
+    def test_link_annotates_the_last_line_and_nothing_else(self):
+        rc, _, _ = self.scratch("link", 2, ticket="xx-0007")   # id normalised
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.read(),
+                         "# notes\n\nthe closed view is a mess\n"
+                         "needs grouping by epic → XX-0007\n\nask about the bill\n")
+
+    def test_a_second_ticket_extends_the_arrow_and_repeats_are_no_ops(self):
+        self.scratch("link", 3, ticket="XX-0001")
+        self.scratch("link", 3, ticket="XX-0002")
+        self.assertIn("ask about the bill → XX-0001, XX-0002\n", self.read())
+        before = self.read()
+        rc, out, _ = self.scratch("link", 3, ticket="XX-0002")
+        self.assertEqual((rc, self.read()), (0, before))
+        self.assertIn("•", out)
+
+    def test_link_preserves_a_file_with_no_trailing_newline(self):
+        write(self.path, "one\n\ntwo")
+        self.scratch("link", 2, ticket="XX-0009")
+        self.assertEqual(self.read(), "one\n\ntwo → XX-0009")
+
+    def test_link_needs_a_block_and_a_ticket(self):
+        before = self.read()
+        self.assertEqual(self.scratch("link", 9, ticket="XX-0001")[0], 1)
+        self.assertEqual(self.scratch("link", 1)[0], 1)     # no --ticket
+        self.assertEqual(self.read(), before)
+
+    def test_an_id_the_repo_could_never_resolve_is_refused(self):
+        before = self.read()
+        rc, _, err = self.scratch("link", 1, ticket="nonsense")
+        self.assertEqual((rc, self.read()), (1, before))    # nothing written
+        self.assertIn("XX-0000", err)                       # says what it wants
+
+    def test_an_empty_scratchpad_is_not_an_error(self):
+        os.remove(self.path)
+        rc, out, _ = self.scratch()
+        self.assertEqual(rc, 0)
+        self.assertIn("nothing in the scratchpad", out)
+
+
+class TestCaptureTracksItsTicket(RepoCase):
+    """A note stores an id; the status is resolved from the board, every time."""
+
+    def test_listings_resolve_the_referenced_ticket(self):
+        self.new("Real ticket")                            # XX-0001
+        write(os.path.join(self.root, ".interfacile", "todo.md"),
+              "- [x] shipped thing (XX-0001)\n- [x] ghost (XX-0404)\n")
+        payload = json.loads(run(ticket.cmd_todo, repo=self.root, action="list",
+                                 n=None, ticket=None, all=True, json=True)[1])
+        self.assertEqual(payload[0]["tickets"],
+                         [{"id": "XX-0001", "status": "OPEN",
+                           "title": "Real ticket"}])
+        self.assertEqual(payload[1]["tickets"][0]["status"], "unknown")
+
+        self.close("XX-0001", note="done")
+        out = run(ticket.cmd_todo, repo=self.root, action="list", n=None,
+                  ticket=None, all=True, json=False)[1]
+        self.assertIn("XX-0001 CLOSED", out)               # read live, not stored
+        self.assertIn("XX-0404 unknown", out)
 
 
 class TestIdScheme(unittest.TestCase):

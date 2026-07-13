@@ -5,7 +5,7 @@
 Copies the packaged templates into the target repo:
 
     .claude/skills/<name>/SKILL.md   agent skills: new-ticket, work-ticket,
-                                     close-ticket, ticket-status
+                                     close-ticket, ticket-status, capture-ticket
     tickets/README.md                the process doc — how tickets work here
 
 Skills are managed files and are refreshed in place on every run, so `skills`

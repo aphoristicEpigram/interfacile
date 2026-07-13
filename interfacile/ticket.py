@@ -124,6 +124,15 @@ class Repo(object):
         self.id_re = re.compile(
             r"^%s-(?:E\d+|\d{%d}(?:[-.][A-Za-z0-9]+)*)$" % (esc, self.digits))
         self.num_re = re.compile(r"^%s-(\d+)" % esc)
+        # The same id as it appears *inside* prose — a captured note names the
+        # ticket it became, and the tail it names it in: `(PFX-0012, PFX-0013)`
+        # on a to-do item, `→ PFX-0012` on a scratchpad block.
+        ids = r"\b%s-\d{%d}(?:[-.][A-Za-z0-9]+)*\b" % (esc, self.digits)
+        self.link_re = re.compile(ids)
+        self.paren_tail_re = re.compile(
+            r"\(\s*%s(?:\s*,\s*%s)*\s*\)\s*$" % (ids, ids))
+        self.arrow_tail_re = re.compile(
+            r"→\s*%s(?:\s*,\s*%s)*\s*$" % (ids, ids))
 
     def is_epic(self, tid):
         return bool(self.epic_re.match(tid or ""))
@@ -585,6 +594,183 @@ def cmd_drop(args):
 
 
 # --------------------------------------------------------------------------- #
+# Capture — the on-ramp to a ticket. `todo` reads the checkbox list the pop-out
+# writes and ticks an item off once it has become a ticket; `scratch` does the
+# same for prose. Indices are 1-based over the *whole* file, done items and all,
+# so item 3 is item 3 whichever view you asked for and a write never lands on
+# the wrong line.
+#
+# A captured item stores the ticket's id and nothing else. Status is resolved
+# from the board every time it's shown, so a note can't drift out of date.
+# --------------------------------------------------------------------------- #
+def _board_index(repo):
+    cards, _ = repo.cards()
+    return {c.tid: (c.status, unquote(c.fm.get("title", ""))) for c in cards}
+
+
+def _refs(repo, text, index):
+    """[(id, status, title)] for every ticket id named in a captured note.
+    An id the board doesn't know is reported, not swallowed."""
+    return [(tid,) + index.get(tid, ("unknown", ""))
+            for tid in repo.link_re.findall(text)]
+
+
+def _refs_line(refs):
+    if not refs:
+        return ""
+    return "   → " + " · ".join("%s %s" % (tid, st) for tid, st, _ in refs)
+
+
+def _refs_json(refs):
+    return [{"id": tid, "status": st, "title": ti} for tid, st, ti in refs]
+
+
+def _extend_tail(repo, text, tid, tail_re, opener, closer):
+    """Name `tid` at the end of `text`, extending the ids already named there
+    (`(A)` -> `(A, B)`) rather than starting a second group. Unchanged if the
+    text already names that ticket."""
+    if tid in repo.link_re.findall(text):
+        return text
+    m = tail_re.search(text)
+    named = ", ".join(repo.link_re.findall(m.group(0)) + [tid]) if m else tid
+    stem = (text[:m.start()] if m else text).rstrip()   # `opener` owns the space
+    return "%s%s%s%s" % (stem, opener, named, closer)
+
+
+def _valid_id(repo, tid):
+    """A note is only worth marking with an id this repo could actually resolve
+    — otherwise the pointer points nowhere and no listing will ever link it."""
+    if repo.id_re.match(tid):
+        return True
+    sys.stderr.write("%r is not an id here — expected %s-%s.\n"
+                     % (tid, repo.prefix, "0" * repo.digits))
+    return False
+
+
+def link_todo_text(repo, text, tid):
+    """A ticketed to-do item: `feed the cat (XX-0012)`."""
+    return _extend_tail(repo, text, tid, repo.paren_tail_re, " (", ")")
+
+
+def link_scratch_text(repo, text, tid):
+    """A ticketed scratchpad block's last line: `…and a date filter → XX-0012`."""
+    return _extend_tail(repo, text, tid, repo.arrow_tail_re, " → ", "")
+
+
+def cmd_todo(args):
+    repo = Repo(_root(args))
+    items = server.load_todo(repo.root)
+    index = _board_index(repo)
+
+    if args.action == "done":
+        if args.n is None:
+            sys.stderr.write("which item? `interfacile todo` lists them.\n")
+            return 1
+        if not 1 <= args.n <= len(items):
+            sys.stderr.write("no item %d — the list has %d.\n" % (args.n, len(items)))
+            return 1
+        before = server.serialize_todo(items)
+        it = items[args.n - 1]
+        tid = (args.ticket or "").strip().upper()
+        if tid:
+            if not _valid_id(repo, tid):
+                return 1
+            it["text"] = link_todo_text(repo, it["text"], tid)
+        was_done = it["done"]
+        it["done"] = True
+        if server.serialize_todo(items) != before:
+            server.save_todo(repo.root, items)
+        print("%s %d  %s" % ("•" if was_done else "✓", args.n, it["text"]))
+        return 0
+
+    shown = [(n, it) for n, it in enumerate(items, 1)
+             if args.all or not it["done"]]
+    if args.json:
+        _emit_json([{"n": n, "done": it["done"], "text": it["text"],
+                     "tickets": _refs_json(_refs(repo, it["text"], index))}
+                    for n, it in shown])
+        return 0
+    if not items:
+        print("no to-do list yet — add items from the dashboard's 📌 pop-out.")
+        return 0
+    for n, it in shown:
+        print("  [%s] %2d  %s%s" % ("x" if it["done"] else " ", n, it["text"],
+                                    _refs_line(_refs(repo, it["text"], index))))
+    n_done = sum(1 for it in items if it["done"])
+    n_open = len(items) - n_done
+    if not shown:
+        print("  all done. 🎉")
+    print("\n%d open · %d done%s" % (
+        n_open, n_done, "" if args.all else "  (--all to include them)"))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# scratch — the other half of capture. Prose, so the unit is the block (a run of
+# non-blank lines) rather than the line, and a ticketed block is annotated in
+# place: the note stays, with a pointer to what it became.
+# --------------------------------------------------------------------------- #
+def _preview(repo, body, width=44):
+    """A block's first line, without the `→ ID` tail — ids get their own column."""
+    rows = body.splitlines()
+    first = repo.arrow_tail_re.sub("", rows[0]).rstrip() if rows else ""
+    if len(first) > width:
+        first = first[:width - 1].rstrip() + "…"
+    more = len(rows) - 1
+    return first + ("  (+%d line%s)" % (more, "" if more == 1 else "s")
+                    if more > 0 else "")
+
+
+def cmd_scratch(args):
+    repo = Repo(_root(args))
+    text = server.load_note_at(repo.root, "scratch")
+    lines, spans = server.scratch_blocks(text)
+    bodies = [server.block_text(lines, s) for s in spans]
+
+    if args.action == "link":
+        if args.n is None or not args.ticket:
+            sys.stderr.write("usage: interfacile scratch link N --ticket ID\n")
+            return 1
+        if not 1 <= args.n <= len(spans):
+            sys.stderr.write("no block %d — the scratchpad has %d.\n"
+                             % (args.n, len(spans)))
+            return 1
+        span = spans[args.n - 1]
+        body = server.block_text(lines, span)
+        tid = args.ticket.strip().upper()
+        if not _valid_id(repo, tid):
+            return 1
+        named = tid in repo.link_re.findall(body)   # anywhere in the block
+        if not named:
+            # The pointer goes on the block's last line; the rest of the file —
+            # blank lines, indentation, trailing newline — is written back as-is.
+            last = span[1]
+            stem = link_scratch_text(repo, lines[last].rstrip("\r\n"), tid)
+            server.save_note_at(repo.root, "scratch",
+                                server.set_line(lines, last, stem))
+        print("%s %d  %s" % ("•" if named else "✓", args.n, _preview(repo, body)))
+        return 0
+
+    index = _board_index(repo)
+    if args.json:
+        _emit_json([{"n": n, "text": body,
+                     "tickets": _refs_json(_refs(repo, body, index))}
+                    for n, body in enumerate(bodies, 1)])
+        return 0
+    if not bodies:
+        print("nothing in the scratchpad — write in the dashboard's 📝 pop-out.")
+        return 0
+    linked = 0
+    for n, body in enumerate(bodies, 1):
+        refs = _refs(repo, body, index)
+        linked += bool(refs)
+        print("  %2d  %-46s%s" % (n, _preview(body), _refs_line(refs).lstrip()))
+    print("\n%d block%s · %d ticketed" % (
+        len(bodies), "" if len(bodies) == 1 else "s", linked))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # lint
 # --------------------------------------------------------------------------- #
 def cmd_lint(args):
@@ -709,7 +895,7 @@ def cmd_lint(args):
 # CLI wiring — cli.py calls add_commands(sub) and dispatches via args.func.
 # --------------------------------------------------------------------------- #
 COMMANDS = ("new", "tickets", "ready", "show", "deps", "close", "reopen",
-            "drop", "lint")
+            "drop", "lint", "todo", "scratch")
 
 
 def add_commands(sub):
@@ -766,3 +952,21 @@ def add_commands(sub):
 
     lp = parser("lint", "validate every ticket against the standard", cmd_lint)
     lp.add_argument("--json", action="store_true", help="machine-readable output")
+
+    tdp = parser("todo", "list the to-do pop-out's items, or tick one off", cmd_todo)
+    tdp.add_argument("action", nargs="?", default="list", choices=("list", "done"))
+    tdp.add_argument("n", nargs="?", type=int, metavar="N",
+                     help="item number (from `interfacile todo`)")
+    tdp.add_argument("--ticket", default=None, metavar="ID",
+                     help="the ticket it became — appended to the item as (ID)")
+    tdp.add_argument("--all", action="store_true", help="include done items")
+    tdp.add_argument("--json", action="store_true", help="machine-readable output")
+
+    scp = parser("scratch", "list the scratchpad's blocks, or point one at a "
+                            "ticket", cmd_scratch)
+    scp.add_argument("action", nargs="?", default="list", choices=("list", "link"))
+    scp.add_argument("n", nargs="?", type=int, metavar="N",
+                     help="block number (from `interfacile scratch`)")
+    scp.add_argument("--ticket", default=None, metavar="ID",
+                     help="the ticket it became — appended to the block as → ID")
+    scp.add_argument("--json", action="store_true", help="machine-readable output")

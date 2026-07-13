@@ -20,6 +20,13 @@ class TestScaffold(unittest.TestCase):
     def skill(self, name):
         return os.path.join(self.root, scaffold.SKILLS_REL, name, "SKILL.md")
 
+    def test_install_writes_every_packaged_skill(self):
+        scaffold.install(self.root, "ZZ")
+        for name in ("new-ticket", "work-ticket", "close-ticket",
+                     "ticket-status", "capture-ticket"):
+            self.assertIn(name, scaffold.skill_names())
+            self.assertTrue(os.path.exists(self.skill(name)), name)
+
     def test_install_substitutes_prefix_and_stamps_version(self):
         done = scaffold.install(self.root, "ZZ")
         self.assertTrue(all(a == "wrote" for a, _ in done))

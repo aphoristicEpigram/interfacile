@@ -133,5 +133,38 @@ class TestDocRules(unittest.TestCase):
         self.assertEqual(out, "<pre>PR-001</pre>")
 
 
+class TestIdIndex(unittest.TestCase):
+    """`/api/ids` — what the notes pop-out resolves a captured id against."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="ifc-test-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self._saved = (server.REPO_ROOT, server.TICKETS_DIR, server.PFX)
+        self.addCleanup(self._restore)
+        server.REPO_ROOT = self.root
+        server.TICKETS_DIR = os.path.join(self.root, "tickets")
+        server.apply_config({"ids": {"prefix": "ZZ"}})
+
+    def _restore(self):
+        server.REPO_ROOT, server.TICKETS_DIR, server.PFX = self._saved
+        server.apply_config({"ids": {"prefix": self._saved[2]}})
+
+    def card(self, rel, tid, title, status):
+        full = os.path.join(self.root, "tickets", rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as fh:
+            fh.write("---\nid: %s\ntitle: %s\nepic: ZZ-E001\nstatus: %s\n"
+                     "created: 2026-01-01\n---\n\n# %s\n"
+                     % (tid, title, status, tid))
+
+    def test_every_ticket_lands_in_the_index_with_its_status(self):
+        self.card("ZZ-E001-x/open/ZZ-0001-a.md", "ZZ-0001", "Open one", "OPEN")
+        self.card("ZZ-E001-x/closed/ZZ-0002-b.md", "ZZ-0002", "Shut one", "CLOSED")
+        index = server.scan()[0]["index"]
+        self.assertEqual(index["ZZ-0001"],
+                         {"status": "OPEN", "title": "Open one"})
+        self.assertEqual(index["ZZ-0002"]["status"], "CLOSED")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -42,7 +42,11 @@ looks, alongside the (git-ignored) scratchpad, to-do, and pin state.
   between them with a dropdown or a **per-project keyboard shortcut**.
 - 🎫 **A built-in ticket flow** — `new`, `tickets`, `ready`, `close`, `lint`
   straight from the CLI, plus agent skills (`new-ticket`, `work-ticket`,
-  `close-ticket`, `ticket-status`) that `init` installs into your repo.
+  `close-ticket`, `ticket-status`, `capture-ticket`) that `init` installs into
+  your repo.
+- 🪄 **Capture that grows up** — a line in your to-do list or a block in your
+  scratchpad becomes a real ticket, and the note keeps a live link to it, so you
+  can see at a glance what your half-thoughts turned into.
 - 🎨 **14 theme presets + custom palettes** — each interface gets a distinctive
   background so you always know which project you're in. Light & dark automatic,
   switchable from the swatch row at the bottom of the board.
@@ -316,12 +320,37 @@ referee** after any hand edit.
 Changed your mind? `interfacile reopen ID` undoes a close, and
 `interfacile drop ID --why "..."` records a deliberate WONT_FIX (which
 unblocks dependants just like closing). For scripts, CI, and agents,
-`tickets`, `ready`, `show`, and `lint` all take `--json`.
+`tickets`, `ready`, `show`, `todo`, and `lint` all take `--json`.
 
-`interfacile init` also drops four agent skills (`new-ticket`, `work-ticket`,
-`close-ticket`, `ticket-status`) into `.claude/skills/` and the process doc
-into `tickets/README.md`, so an agent working in your repo follows the same
-flow. Refresh them any time with `interfacile skills` — the files are
+**From a half-thought to a ticket.** The 📌 to-do pop-out and the 📝 scratchpad
+are where ideas land; `todo` and `scratch` are how they grow up:
+
+```bash
+interfacile todo                                # open items, numbered
+interfacile todo done 3 --ticket TK-0007        # tick it off, link the ticket
+
+interfacile scratch                             # blocks of prose, numbered
+interfacile scratch link 2 --ticket TK-0008     # point the note at its ticket
+```
+
+Numbers are stable (they count finished items too), and the CLI writes the same
+files the pop-outs read, so a browser tab left open won't fight you. Marking is
+additive — a to-do gets `(TK-0007)`, a scratchpad block gets `→ TK-0008`, and a
+note that spawned two tickets names both. Nothing you wrote is ever deleted.
+
+The note stores the **id only**; the status is resolved from the board every
+time it's shown. So `interfacile todo` tells you `TK-0007 CLOSED`, and in the
+dashboard the id is a live link chipped with its current status — the to-do list
+becomes a way to follow the work, not just a place ideas go to die.
+
+The `capture-ticket` skill drives all of this: it reads both sources, asks what a
+one-liner leaves out, drafts the ticket through `new-ticket`, and marks the note
+with the new id.
+
+`interfacile init` also drops five agent skills (`new-ticket`, `work-ticket`,
+`close-ticket`, `ticket-status`, `capture-ticket`) into `.claude/skills/` and the
+process doc into `tickets/README.md`, so an agent working in your repo follows
+the same flow. Refresh them any time with `interfacile skills` — the files are
 version-stamped, and `lint` nudges you when they're stale.
 
 ## Troubleshooting
