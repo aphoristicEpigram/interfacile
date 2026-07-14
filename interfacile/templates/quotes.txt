@@ -1,0 +1,143 @@
+# One quote per line: <quote> --- <author>. Blank lines and # comments are
+# skipped. To make these yours, copy this file to .interfacile/quotes.txt in
+# your repo and edit away; set "quotes": false in config.json to hide them.
+Where focus goes, energy flows --- Tony Robbins
+Change your energy, change your life --- Joe Dispenza
+You are the universe experiencing itself in temporary human form --- Deepak Chopra
+Realize deeply that the present moment is all you ever have --- Eckhart Tolle
+The feeling is the prayer --- Gregg Braden
+You are a vibrational being in a vibrational universe --- Esther Hicks
+You are not the voice of the mind, you are the one who hears it --- Michael Singer
+We change the world not by what we say or do, but as a consequence of what we have become --- David Hawkins
+Be realistic: plan for a miracle --- Osho
+Feeling is understanding --- Wim Hof
+Happiness is the new productivity --- Vishen Lakhiani
+Freedom is the recognition that you are already whole --- Peter Crone
+Gratitude is the key that opens the door to the heart --- John Demartini
+You are the artist of your own life --- Don Miguel Ruiz
+You are loved, and you are not alone --- Eben Alexander
+Love yourself like your life depends on it, because it does --- Anita Moorjani
+You are making it all up anyway, so make it up the way you want it to be --- Neale Donald Walsch
+I am a lover of what is --- Byron Katie
+Time spent on self-love is never wasted --- Jay Shetty
+You are not a human being having a spiritual experience, you are a spiritual being having a human experience --- Wayne Dyer
+Our deepest fear is not that we are inadequate, our deepest fear is that we are powerful beyond measure --- Marianne Williamson
+We are all just walking each other home --- Ram Dass
+Be here now --- Ram Dass
+What you seek is seeking you --- Rumi
+You are the sky, everything else is just the weather --- Pema Chödrön
+Peace comes from within, do not seek it without --- Buddha
+The mind is everything, what you think you become --- Buddha
+Your thoughts are the language of your brain, and your feelings are the language of your body --- Joe Dispenza
+The quantum field responds to who you are being --- Joe Dispenza
+Your beliefs act like filters on a camera, changing how you see the world --- Bruce Lipton
+The moment you change your perception is the moment you rewrite the chemistry of your body --- Bruce Lipton
+We are the technology we've been waiting for --- Gregg Braden
+Let your alignment be your priority --- Esther Hicks
+The universe adores you and is always helping you --- Esther Hicks
+Surrender is the ultimate sign of strength --- Michael Singer
+Love is the supreme power of life --- David Hawkins
+Truth is not something outside to be discovered, it is something inside to be realized --- Osho
+Courage is a love affair with the unknown --- Osho
+Breathe, and the body knows the way --- Wim Hof
+Bend reality by blending rules --- Vishen Lakhiani
+Your limitations are invitations to expand --- Peter Crone
+What you see in others exists in you --- John Demartini
+Speak with integrity, and the world reflects your truth --- Don Miguel Ruiz
+Consciousness survives beyond the brain --- Eben Alexander
+Fear is the only darkness --- Anita Moorjani
+There is no blackboard in the sky where your purpose is written in stone --- Neale Donald Walsch
+Your passion is for you, your purpose is for others --- Jay Shetty
+When you change the way you look at things, the things you look at change --- Wayne Dyer
+You have within you right now, everything you need --- Wayne Dyer
+As you think, so shall you become --- Bruce Lee
+The successful warrior is the average man with laser-like focus --- Bruce Lee
+Your imagination is the preview of life's coming attractions --- Albert Einstein
+Everything is energy and that is all there is to it --- Albert Einstein
+If you want to find the secrets of the universe, think in terms of energy, frequency and vibration --- Nikola Tesla
+My brain is only a receiver, in the Universe there is a core from which we obtain knowledge, strength and inspiration --- Nikola Tesla
+The day science begins to study non-physical phenomena, it will make more progress in one decade than in all previous centuries --- Nikola Tesla
+You are a child of the universe, no less than the trees and the stars --- Max Ehrmann
+With all its sham, drudgery and broken dreams, it is still a beautiful world --- Max Ehrmann
+Keep your face always toward the sunshine, and shadows will fall behind you --- Walt Whitman
+Every moment is a fresh beginning --- T.S. Eliot
+You are never too old to set another goal or to dream a new dream --- C.S. Lewis
+Stay hungry, stay foolish --- Steve Jobs
+Whatever you can do or dream you can, begin it --- Johann Wolfgang von Goethe
+Magic is believing in yourself, if you can do that, you can make anything happen --- Johann Wolfgang von Goethe
+You are the master of your destiny --- Napoleon Hill
+Whatever the mind can conceive and believe, it can achieve --- Napoleon Hill
+The only limit to our realization of tomorrow will be our doubts of today --- Franklin D. Roosevelt
+Believe you can and you're halfway there --- Theodore Roosevelt
+It is during our darkest moments that we must focus to see the light --- Aristotle Onassis
+The best way to predict the future is to create it --- Peter Drucker
+Act as if what you do makes a difference, it does --- William James
+Vulnerability is not winning or losing, it's having the courage to show up --- Brené Brown
+You can do hard things --- Glennon Doyle
+Your fear is the most boring thing about you --- Elizabeth Gilbert
+The universe is not outside of you, look inside yourself and everything you want, you already are --- Rumi
+Let the beauty of what you love be what you do --- Rumi
+Why are you so enchanted by this world, when a mine of gold lies within you --- Rumi
+Shine like the whole universe is yours --- Rumi
+Live life as if everything is rigged in your favor --- Rumi
+I am not this hair, I am not this skin, I am the soul that lives within --- Rumi
+You are the placebo --- Joe Dispenza
+Break the habit of being yourself --- Joe Dispenza
+In the midst of movement and chaos, keep stillness inside of you --- Deepak Chopra
+The present moment is a conspiracy of the universe on your behalf --- Deepak Chopra
+Realize deeply that you are not your thoughts, you are the awareness behind them --- Eckhart Tolle
+Life will give you whatever experience is most helpful for the evolution of your consciousness --- Eckhart Tolle
+The heart knows things that the mind cannot explain --- Gregg Braden
+You are the creator of your own reality --- Esther Hicks
+There is nothing that you cannot be, do or have --- Esther Hicks
+When you surrender, the universe can do for you what you cannot do for yourself --- Michael Singer
+Everything is happening for you, not to you --- Tony Robbins
+I am the love I have been waiting for --- Byron Katie
+Drop the idea of becoming someone, because you are already a masterpiece --- Osho
+Creativity is the greatest rebellion in existence --- Osho
+The cold brings you home to yourself --- Wim Hof
+Your brain is a receiver of cosmic possibility --- Vishen Lakhiani
+The truth of who you are is never lost, only forgotten --- Peter Crone
+When you are grateful, fear disappears and abundance appears --- Tony Robbins
+The path to success is to take massive, determined action --- Tony Robbins
+People who succeed have momentum --- Tony Robbins
+The only impossible journey is the one you never begin --- Tony Robbins
+It is in your moments of decision that your destiny is shaped --- Tony Robbins
+You have greatness within you --- Les Brown
+Shoot for the moon, even if you miss you'll land among the stars --- Norman Vincent Peale
+What lies behind us and what lies before us are tiny matters compared to what lies within us --- Ralph Waldo Emerson
+The only person you are destined to become is the person you decide to be --- Ralph Waldo Emerson
+Do not go where the path may lead, go instead where there is no path and leave a trail --- Ralph Waldo Emerson
+Once you make a decision, the universe conspires to make it happen --- Ralph Waldo Emerson
+You are the universe, expressing itself as a human for a little while --- Eckhart Tolle
+This is the real secret of life: to be completely engaged with what you are doing in the here and now --- Alan Watts
+You are that vast thing that you see far off with great telescopes --- Alan Watts
+You are an aperture through which the universe is looking at and exploring itself --- Alan Watts
+The only way to make sense out of change is to plunge into it, move with it, and join the dance --- Alan Watts
+No valid plans for the future can be made by those who have no capacity for living now --- Alan Watts
+You are the big bang resting on a leaf --- Panache Desai
+The cosmos is within us, we are made of star-stuff --- Carl Sagan
+We are a way for the cosmos to know itself --- Carl Sagan
+Every atom in your body came from a star that exploded --- Lawrence Krauss
+You are not a drop in the ocean, you are the entire ocean in a drop --- Rumi
+Let yourself be silently drawn by the strange pull of what you really love --- Rumi
+There is a voice inside that doesn't use words, listen --- Rumi
+Sell your cleverness and buy bewilderment --- Rumi
+When you do things from your soul, you feel a river moving in you, a joy --- Rumi
+Be like a tree and let the dead leaves drop --- Rumi
+Let yourself become living poetry --- Rumi
+The garden of the world has no limits, except in your mind --- Rumi
+Dance until you shatter yourself --- Rumi
+Wherever you are, and whatever you do, be in love --- Rumi
+You have no need to travel anywhere, journey within yourself --- Rumi
+Everything in the universe is within you, ask all from yourself --- Rumi
+I am in the right place at the right time, doing the right thing --- Louise Hay
+Whatever arises, love that --- Matt Kahn
+You are enough, exactly as you are --- Panache Desai
+Nothing can dim the light which shines from within --- Maya Angelou
+You become what you believe --- Oprah Winfrey
+Life opens up when you do --- Jim Carrey
+The universe is always listening --- Russell Brand
+You are the author of your next chapter --- Lisa Nichols
+You are the light of the world, don't let anyone dim your shine --- Iyanla Vanzant
+The way you tell your story is the way you live your life --- Martha Beck

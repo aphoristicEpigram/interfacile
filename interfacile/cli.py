@@ -15,6 +15,9 @@
     interfacile unregister [PATH]     remove a repo from the registry
     interfacile list                  list registered interfaces
 
+    interfacile ps                    servers you have running (pid, port, url)
+    interfacile stop [--all]          stop this repo's server, or every one
+
 The ticket flow (see `interfacile <cmd> -h`):
     new · tickets · ready · show · deps · close · lint
     todo · scratch                    capture: the pop-out notes, and the
@@ -28,8 +31,10 @@ import json
 import os
 import re
 import sys
+import time
 
 from . import __version__
+from . import procs
 from . import scaffold
 from . import server
 from . import ticket
@@ -405,6 +410,55 @@ def cmd_list(args):
 
 
 # --------------------------------------------------------------------------- #
+# ps / stop — the servers you have running, and how to end them
+# --------------------------------------------------------------------------- #
+def _uptime(started):
+    secs = int(max(0, time.time() - (started or 0)))
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        return "%dm" % (secs // 60)
+    return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+
+
+def _server_line(rec):
+    names = ", ".join(os.path.basename(r.rstrip("/")) for r in rec.get("roots", []))
+    return "  %-7s %-6s %-34s %-5s %s" % (
+        rec.get("pid", "?"), rec.get("port", "?"), rec.get("url", ""),
+        _uptime(rec.get("started")), names)
+
+
+def cmd_ps(args):
+    running = procs.servers()
+    if args.json:
+        print(json.dumps(running, indent=2))
+        return
+    if not running:
+        print("no interfacile servers running.")
+        return
+    print("  %-7s %-6s %-34s %-5s %s" % ("PID", "PORT", "URL", "UP", "SERVING"))
+    for rec in running:
+        print(_server_line(rec))
+
+
+def cmd_stop(args):
+    root = os.path.abspath(args.repo or os.getcwd())
+    running = procs.servers() if args.all else procs.serving(root)
+    if not running:
+        where = "anywhere" if args.all else "for %s" % root
+        print("no interfacile server running %s.%s" % (
+            where, "" if args.all else "  (--all to see every repo's)"))
+        return
+    for rec in procs.stop(running):
+        print("stopped pid %s  (%s)" % (rec["pid"], rec.get("url", "")))
+    # Give them a moment to unregister themselves, then report what's left.
+    time.sleep(0.3)
+    left = procs.servers()
+    if left:
+        print("%d still running — `interfacile ps`" % len(left))
+
+
+# --------------------------------------------------------------------------- #
 # serve / hub
 # --------------------------------------------------------------------------- #
 def _add_serve_flags(p):
@@ -474,9 +528,17 @@ def main(argv=None):
     up.add_argument("path", nargs="?", default=None)
     sub.add_parser("list", help="list registered interfaces")
 
+    pp = sub.add_parser("ps", help="servers you have running (pid, port, url)")
+    pp.add_argument("--json", action="store_true", help="machine-readable output")
+    tp = sub.add_parser("stop", help="stop this repo's server (--all: every one)")
+    tp.add_argument("--repo", default=None, metavar="PATH",
+                    help="repo root (default: current directory)")
+    tp.add_argument("--all", action="store_true",
+                    help="stop every interfacile server, whatever it serves")
+
     # Bare `interfacile` (or leading flags with no subcommand) serves the cwd.
     known = (("serve", "hub", "init", "epics", "skills", "shortcut",
-              "register", "unregister", "list",
+              "register", "unregister", "list", "ps", "stop",
               "-h", "--help", "--version") + ticket.COMMANDS)
     if not argv or argv[0] not in known:
         args = ap.parse_args(["serve"] + argv)
@@ -508,6 +570,10 @@ def main(argv=None):
         cmd_unregister(args)
     elif args.cmd == "list":
         cmd_list(args)
+    elif args.cmd == "ps":
+        cmd_ps(args)
+    elif args.cmd == "stop":
+        cmd_stop(args)
     else:  # serve
         _serve([os.path.abspath(args.repo or os.getcwd())], args)
 

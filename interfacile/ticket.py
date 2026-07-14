@@ -31,6 +31,7 @@ import os
 import re
 import sys
 
+from . import events
 from . import server
 
 VALID_STATUS = ("OPEN", "CLOSED", "WONT_FIX", "STANDING")
@@ -269,6 +270,14 @@ _How to solve it. Rough direction is fine; refine before starting work._
 """
 
 
+def _log(repo, kind, tid):
+    """Record a CLI mutation in the hub-wide event log — the same
+    stream the dashboard writes to, so an automation watching for a
+    close hears it whether it came from a click or a command."""
+    events.record(kind, ticket=tid, repo=repo.root,
+                  interface=os.path.basename(repo.root.rstrip(os.sep)))
+
+
 def cmd_new(args):
     repo = Repo(_root(args))
     if not os.path.isdir(repo.tickets_dir):
@@ -325,6 +334,7 @@ def cmd_new(args):
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
     print("%s created: %s" % (tid, os.path.relpath(path, repo.root)))
+    _log(repo, "new", tid)
     print("Fill in Context / Approach / Acceptance criteria, then `interfacile lint`.")
     return 0
 
@@ -529,6 +539,7 @@ def cmd_close(args):
         _set_field(fm_lines, "index_note", " ".join(args.note.split()))
     dest = _rewrite(card, fm_lines, body, "closed")
     print("%s closed: %s" % (card.tid, os.path.relpath(dest, repo.root)))
+    _log(repo, "close", card.tid)
     _report_unblocked(card, cards, by_id)
     return 0
 
@@ -560,6 +571,7 @@ def cmd_reopen(args):
     _set_field(fm_lines, "updated", datetime.date.today().isoformat())
     dest = _rewrite(card, fm_lines, body, "open")
     print("%s reopened: %s" % (card.tid, os.path.relpath(dest, repo.root)))
+    _log(repo, "reopen", card.tid)
     print("Anything that depended on it is blocked again — `interfacile ready` "
           "to see the effect.")
     return 0
@@ -589,6 +601,7 @@ def cmd_drop(args):
     _set_field(fm_lines, "index_note", " ".join(args.why.split()))
     dest = _rewrite(card, fm_lines, body, "closed")
     print("%s dropped (WONT_FIX): %s" % (card.tid, os.path.relpath(dest, repo.root)))
+    _log(repo, "drop", card.tid)
     _report_unblocked(card, cards, _by_id(cards))
     return 0
 

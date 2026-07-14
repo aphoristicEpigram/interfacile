@@ -249,6 +249,7 @@ A hidden `.interfacile/config.json` at a repo root controls that interface:
 | `epics` | per-epic titles + emoji |
 | `links` | quick links in the header (`emoji`, `title`, `url`) |
 | `theme` | a preset name, or a full custom palette |
+| `quotes` | `false` hides the header quote (default on); edit `.interfacile/quotes.txt` to supply your own `quote --- author` lines |
 | `documents` | document series (`PR-###`, `RFC-###`) — the full ADR treatment: linked mentions, an index page, the jump box |
 | `server.port` | default port |
 
@@ -296,6 +297,21 @@ closed: 2026-06-20     # required when status is CLOSED
 One folder per epic; the `open/` and `closed/` subfolders are for humans — a
 ticket's real state is its `status:` field. See a live example under
 [`examples/tickets/`](examples/tickets/).
+
+## Running servers
+
+A tool that starts processes should tell you which ones it started:
+
+```bash
+interfacile ps            # pid, port, url, and what each one is serving
+interfacile stop          # stop this repo's server
+interfacile stop --all    # stop every one of them
+```
+
+Each server records itself while it runs and clears the record on the way out
+(Ctrl-C included). Start `interfacile` in a repo that's already being served and
+it won't start a second one — it opens the one you have. And a port held by
+something else says so, with a free port to try, instead of a socket traceback.
 
 ## The ticket flow
 

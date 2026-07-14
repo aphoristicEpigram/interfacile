@@ -51,7 +51,7 @@
       "url": "https://github.com/aphoristicEpigram/interfacile#readme"
     }
   ],
-  "theme": "slate",
+  "theme": "teal",
   "server": {
     "port": 8790
   }

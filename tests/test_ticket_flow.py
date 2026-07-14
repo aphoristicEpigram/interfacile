@@ -38,6 +38,14 @@ class RepoCase(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="ifc-test-")
         self.addCleanup(shutil.rmtree, self.root, True)
+        # Ticket commands record interactions in the hub-wide event log under
+        # XDG_CONFIG_HOME. Point it at a temp dir: a test must never write into
+        # the counters the developer's own automations are watching.
+        self.home = tempfile.mkdtemp(prefix="ifc-test-home-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self._old_home = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = self.home
+        self.addCleanup(self._restore_home)
         write(os.path.join(self.root, ".interfacile", "config.json"),
               json.dumps({"ids": {"prefix": "XX", "digits": 4}}))
         self.epic_dir = os.path.join(self.root, "tickets", "XX-E001-first-epic")
@@ -46,6 +54,12 @@ class RepoCase(unittest.TestCase):
               "index_exempt: true\n---\n\n# XX-E001\n")
         os.makedirs(os.path.join(self.epic_dir, "open"), exist_ok=True)
         os.makedirs(os.path.join(self.epic_dir, "closed"), exist_ok=True)
+
+    def _restore_home(self):
+        if self._old_home is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._old_home
 
     # ------------------------------------------------------------------ #
     # helpers

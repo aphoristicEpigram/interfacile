@@ -15,18 +15,25 @@ Standard library only -- no third-party dependencies.
 """
 
 import argparse
+import atexit
 import collections
 import datetime
+import errno
 import glob
 import html
 import json
 import os
+import random
 import re
+import signal
 import sys
 import threading
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from . import events
+from . import procs
 
 # Target repo to scan. Defaults to the repo this script lives in (two levels up),
 # but can point at any project via $TICKET_DASHBOARD_REPO or the --repo flag, so
@@ -57,6 +64,7 @@ FAVICON = "🎟️"                   # browser-tab icon glyph
 HEADER_ICON = "🎟️"               # mark shown beside the title (defaults to favicon)
 EYEBROW = "Ticket portfolio &middot; engineering program"
 TAGLINE = "This project is tracked as"
+QUOTES_ON = True                 # config "quotes": false hides the header quote
 SERVER_PORT = 8787               # default listen port (config/--port override)
 THEME_REMAP = {}                 # canonical(blue)->theme hex map; {} == blue
 THEME_STRIP = None               # signature-strip colours, or None
@@ -83,17 +91,21 @@ def make_id_res(prefix, digits=4):
     (<PFX>-0104A) parses to the same segments as <PFX>-0104-A."""
     p = re.escape(prefix)
     d = r"\d{%d}" % int(digits)
+    # One suffix segment: uppercase letters (-A), digits (.1), or a lowercase
+    # roman numeral (-iii). Romans stop at i/v/x (1..39) so an id glued to an
+    # ordinary word in a slug or sentence (-cli, -mid) never matches as one.
+    s = r"(?:\d+|[A-Z]+|[ivx]+)"
     return {
         "ticket_id":    re.compile(r"^%s-%s" % (p, d)),
         "epic_code":    re.compile(r"%s-E(\d+)" % p),
         "ticket_parts": re.compile(r"^(%s-%s)[-.]?(.*)$" % (p, d)),
-        "ticket_split": re.compile(r"^%s-(%s)(?:-([A-Z]+))?$" % (p, d)),
-        "dep_id":       re.compile(r"%s-%s(?:-[A-Z]+)?" % (p, d)),
-        "sub_id":       re.compile(r"^(%s-%s)-([A-Z]+)$" % (p, d)),
-        "ticket_link":  re.compile(r"\b%s-%s(?:-[A-Z]+)?\b" % (p, d)),
+        "ticket_split": re.compile(r"^%s-(%s)((?:[-.]%s)*)$" % (p, d, s)),
+        "dep_id":       re.compile(r"%s-%s(?:[-.]%s)*" % (p, d, s)),
+        "sub_id":       re.compile(r"^(%s-%s)(?:[-.]%s)+$" % (p, d, s)),
+        "ticket_link":  re.compile(r"\b%s-%s(?:[-.]%s)*\b" % (p, d, s)),
         "epic_link":    re.compile(r"\b%s-E(\d{1,3})\b" % p),
         "md_epic":      re.compile(r"^%s-E(\d{1,3})\b" % p),
-        "md_ticket":    re.compile(r"^(%s-%s(?:-[A-Z]+)?)\b" % (p, d)),
+        "md_ticket":    re.compile(r"^(%s-%s(?:[-.]%s)*)\b" % (p, d, s)),
     }
 
 
@@ -372,6 +384,90 @@ def save_pins(pins):
     os.replace(tmp, PINS_FILE)
 
 
+# The code-review checklist: ticket id -> ISO timestamp, the pin file's shape in
+# The review tick lives IN the ticket: a `## Reviewed ✅` section in the body
+# is the one source of truth — visible in the file, versioned with the repo,
+# togglable from any list. (Its predecessor, .interfacile/review.json, is no
+# longer read; a one-off sweep migrates old state into the files.)
+_REVIEWED_RE = re.compile(r"^##\s+Reviewed(?:\s*✅️?)?\s*$", re.M)
+_REVIEWED_BLOCK_RE = re.compile(
+    r"\n*^##\s+Reviewed(?:\s*✅️?)?\s*$.*?(?=^##\s|\Z)", re.M | re.S)
+
+
+def is_reviewed(body):
+    return bool(_REVIEWED_RE.search(body))
+
+
+def load_quotes():
+    """(quote, author) pairs for the header — `.interfacile/quotes.txt` if the
+    repo carries its own, else the packaged default. One `quote --- author`
+    per line; blank lines and #-comments are skipped, a missing author is
+    fine. Editing the repo file makes the rotation yours."""
+    for path in (os.path.join(os.path.dirname(PINS_FILE), "quotes.txt"),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "templates", "quotes.txt")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        out = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            q, _, a = line.partition("---")
+            if q.strip():
+                out.append((q.strip(), a.strip()))
+        if out:
+            return out
+    return []
+
+
+def _record(kind, ticket=None, **extra):
+    """Log one ticket interaction against the interface serving this request.
+    The hub-wide log (events.py) is what automations poll."""
+    return events.record(kind, ticket=ticket, interface=ACTIVE_SLUG,
+                         repo=REPO_ROOT, **extra)
+
+
+def pick_quote():
+    """One random {text, by}, or None when quotes are off / the file is empty."""
+    if not QUOTES_ON:
+        return None
+    quotes = load_quotes()
+    if not quotes:
+        return None
+    q, a = random.choice(quotes)
+    return {"text": q, "by": a}
+
+
+def quote_html():
+    """The header quote as rendered on page load. The dashboard re-renders it
+    from /api/data on Regenerate, so both paths draw the same shape."""
+    q = pick_quote()
+    if not q:
+        return ""
+    return ('<span class="h-quote" id="hQuote">“%s”%s</span>'
+            % (html.escape(q["text"]),
+               ' <span class="q-by">— %s</span>' % html.escape(q["by"])
+               if q["by"] else ""))
+
+
+def set_reviewed(path, want, when=None):
+    """Add or remove the ticket's `## Reviewed ✅` section, at its tail."""
+    text = read_text(path)
+    new = _REVIEWED_BLOCK_RE.sub("", text).rstrip("\n") + "\n"
+    if want:
+        new += "\n## Reviewed ✅\n\n%s\n" % (when or datetime.date.today().isoformat())
+    if new == text:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(new)
+    os.replace(tmp, path)
+
+
 # Scratch pad / to-do pop-outs: two free-form files in `.interfacile/`. No
 # history, no schema — the dashboard just reads and rewrites the whole file, so
 # whatever was there greets you on the next run.
@@ -609,7 +705,7 @@ def scan():
     wip_list = []                # (file mtime, ticket record)
     last_worked = {"mtime": 0.0}
     for path in glob.glob(os.path.join(TICKETS_DIR, "**", "*.md"), recursive=True):
-        fm_lines, _ = split_frontmatter(read_text(path))
+        fm_lines, body = split_frontmatter(read_text(path))
         if not fm_lines:
             continue
         fm = {k: v for k, v in frontmatter_scalars(fm_lines)}
@@ -630,7 +726,7 @@ def scan():
                 "priority": priority if priority.isdigit() else "",
                 "effort": effort if effort_h is not None else "",
                 "effortH": effort_h, "epic": code, "wip": tid in wip_ids,
-                "pinned": tid in pins,
+                "pinned": tid in pins, "reviewed": is_reviewed(body),
                 "slug": os.path.basename(path)[:-3]}   # id-title filename, for "copy ids"
         node_meta[tid] = {"id": tid, "title": title, "status": status,
                           "created": _iso(cdate), "closed": _iso(xdate)}
@@ -1152,9 +1248,9 @@ TICKET_CSS = """
 --mut:#5d6a77;--line:#d6dde5;--accent:#1c3bb3;--done:#2f9e5b;--wf:#8a94a0;--warn:#b3781a;
 --font:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
 --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;}
-@media (prefers-color-scheme:dark){:root{--bg:#0b0f15;--surface:#141b25;--surface2:#0f1620;
---ink:#e8edf3;--ink2:#c2ccd6;--mut:#8b98a6;--line:#26313e;--accent:#a9bdff;--done:#48c483;
---wf:#69747f;--warn:#d9a441;}}
+@media (prefers-color-scheme:dark){:root{--bg:#090e16;--surface:#151e2d;--surface2:#101724;
+--ink:#edf2f9;--ink2:#c6d2e0;--mut:#8fa0b5;--line:#2a3a4d;--accent:#a9bdff;--done:#48c483;
+--wf:#75828f;--warn:#d9a441;}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);line-height:1.6;
 -webkit-font-smoothing:antialiased;padding:32px 20px 80px}
@@ -1168,8 +1264,8 @@ h1.title{font-size:1.7rem;line-height:1.2;letter-spacing:-.02em;margin:.2em 0 .5
 padding:3px 9px;border-radius:5px;vertical-align:middle}
 .b-open{background:#dbe2fb;color:#1c3bb3}.b-closed{background:#d3ecdc;color:#2f9e5b}
 .b-wf{background:#e2e6ea;color:#5d6a77}
-@media (prefers-color-scheme:dark){.b-open{background:#1c2740;color:#a9bdff}
-.b-closed{background:#16311f;color:#48c483}.b-wf{background:#222c37;color:#8b98a6}}
+@media (prefers-color-scheme:dark){.b-open{background:#1d2b4d;color:#a9bdff}
+.b-closed{background:#143423;color:#48c483}.b-wf{background:#243141;color:#8fa0b5}}
 .fm{background:var(--surface);border:1px solid var(--line);border-radius:9px;overflow:hidden;margin:0 0 28px}
 .fm .fm-h{font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;
 color:var(--mut);padding:11px 16px;border-bottom:1px solid var(--line);background:var(--surface2)}
@@ -1208,6 +1304,10 @@ color:var(--ink2);border-radius:7px;padding:7px 14px;cursor:pointer}
 .tb:disabled{opacity:.55;cursor:progress}
 .tb.pin{margin-left:auto}
 .tb.pin.pinned{border-color:var(--warn);color:var(--warn);font-weight:600}
+.tb.revchip{color:var(--mut)}
+.tb.revchip:hover{color:var(--done);border-color:var(--done)}
+.tb.revchip.on{color:var(--done);border-color:var(--done);font-weight:700;
+background:color-mix(in srgb,var(--done) 14%,transparent)}
 a.tb.dep{text-decoration:none;color:var(--accent);border-color:var(--accent)}
 a.tb.dep:hover{background:var(--surface2);filter:brightness(1.05)}
 .editmsg{font-family:var(--mono);font-size:.74rem;color:var(--mut)}
@@ -1404,6 +1504,7 @@ def render_ticket_page(path, known_ids=None, known_epics=None, adrs=None,
     title = fm.get("title", "").strip().strip('"') or tid
     status = fm.get("status", "").upper()
     badge_cls = STATUS_BADGE.get(status, "b-wf")
+    reviewed = is_reviewed(body)
 
     rows = ""
     for k, v in pairs:
@@ -1453,6 +1554,10 @@ def render_ticket_page(path, known_ids=None, known_epics=None, adrs=None,
         "<span class='editmsg' id='editMsg'></span>"
         "<button class='tb pin' id='pinBtn' type='button' data-pinned='"
         + ("1" if pinned else "0") + "'>&#128278;</button>"
+        "<button class='tb revchip" + (" on" if reviewed else "") + "' type='button'"
+        " aria-checked='" + ("true" if reviewed else "false") + "'"
+        " data-review='" + html.escape(tid, quote=True) + "'"
+        " title='Code reviewed &mdash; click to toggle'>&#10003; Reviewed</button>"
         "<button class='tb copy-one' type='button' data-copy='"
         + html.escape(os.path.basename(path)[:-3], quote=True)
         + "' title='Copy this ticket&#39;s id'>&#128203; Copy</button></div>"
@@ -1630,8 +1735,14 @@ border:1px solid var(--line);border-radius:100px;padding:7px 13px;width:210px}
 .searchbox::placeholder{color:var(--mut)}
 .searchbox:focus{outline:2px solid var(--accent);outline-offset:1px}
 .sortlab{font-family:var(--mono);font-size:.72rem;color:var(--mut);display:flex;align-items:center;gap:6px}
+/* designed select: our own face and caret, not the browser's */
 .sortsel{font-family:var(--mono);font-size:.72rem;color:var(--ink);background:var(--surface);
-border:1px solid var(--line);border-radius:7px;padding:5px 9px;cursor:pointer}
+border:1px solid var(--line);border-radius:7px;padding:5px 24px 5px 10px;cursor:pointer;
+appearance:none;-webkit-appearance:none;
+background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M1 1l3 3 3-3' fill='none' stroke='%237d8894' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+background-repeat:no-repeat;background-position:right 9px center}
+.sortsel:hover{border-color:var(--accent)}
+.sortsel:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 .lnk{font-family:var(--mono);font-size:.72rem;color:var(--accent);background:none;border:0;cursor:pointer;padding:0}
 .lnk:hover{text-decoration:underline}
 .mchip.epic-link{cursor:pointer}
@@ -1649,6 +1760,12 @@ border:1px solid var(--line);border-radius:7px;padding:5px 9px;cursor:pointer}
 li:hover .mchip.pin-add,.card:hover .mchip.pin-add{opacity:.5}
 .mchip.pin-add:hover,.mchip.pin-add:focus-visible{opacity:1;color:var(--warn);border-color:var(--warn)}
 @media (hover:none){.mchip.pin-add{opacity:.5}}
+/* the tag filter: a row of pills you toggle — multi-select, icons and all */
+.tagbar{display:inline-flex;gap:5px;flex-wrap:wrap}
+.tagtog{font-family:var(--mono);font-size:.66rem;letter-spacing:.02em;color:var(--mut);
+background:var(--surface);border:1px solid var(--line);border-radius:100px;padding:4px 10px;cursor:pointer}
+.tagtog:hover{border-color:var(--accent);color:var(--accent)}
+.tagtog[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#fff}
 """
 
 
@@ -1658,7 +1775,7 @@ LIST_FILTER_BAR = """
 <div class="fbar">
   <input id="lfSearch" class="searchbox" type="search" placeholder="search __PFX__-#### or title"
          autocomplete="off" aria-label="Filter tickets by id or title">
-  <label class="sortlab">risk <select id="lfRisk" class="sortsel">
+  __STATUS__<label class="sortlab">risk <select id="lfRisk" class="sortsel">
     <option value="">all</option><option value="HIGH">high</option>
     <option value="MEDIUM">medium</option><option value="LOW">low</option></select></label>
   <label class="sortlab">priority <select id="lfPrio" class="sortsel">
@@ -1684,15 +1801,53 @@ _SORT_SELECT = """<label class="sortlab">sort <select id="lfSort" class="sortsel
     <option value="priority">by priority</option>
     <option value="effort">by effort</option></select></label>"""
 
+# Status + tags only appear where one list mixes them (the filtered grid). Epic
+# pages are one column per status, where narrowing by it means hiding a column.
+_STATUS_SELECT = """<label class="sortlab">status <select id="lfStatus" class="sortsel">
+    <option value="">all</option><option value="open">open</option>
+    <option value="closed">closed</option><option value="wf">won&#39;t fix</option></select></label>
+  <span class="sortlab">tags <span class="tagbar" id="lfTags" role="group" aria-label="Filter by tags — pick any">
+    <button type="button" class="tagtog" data-tag="blocked" aria-pressed="false">&#9940; blocked</button>
+    <button type="button" class="tagtog" data-tag="decision" aria-pressed="false">decision</button>
+    <button type="button" class="tagtog" data-tag="wip" aria-pressed="false">wip</button>
+    <button type="button" class="tagtog" data-tag="pinned" aria-pressed="false">&#128278; pinned</button>
+    <button type="button" class="tagtog" data-tag="none" aria-pressed="false">untagged</button>
+    <button type="button" class="tagtog" data-tag="rev-y" aria-pressed="false">&#10003; reviewed</button>
+    <button type="button" class="tagtog" data-tag="rev-n" aria-pressed="false">&#10007; unreviewed</button>
+  </span></span>
+  """
 
-def list_filter_bar(sort_select=True):
-    return LIST_FILTER_BAR.replace("__SORT__", _SORT_SELECT if sort_select else "")
+
+def list_filter_bar(sort_select=True, status_select=False):
+    return (LIST_FILTER_BAR
+            .replace("__SORT__", _SORT_SELECT if sort_select else "")
+            .replace("__STATUS__", _STATUS_SELECT if status_select else ""))
 
 LIST_FILTER_SCRIPT = """<script>
 (function(){
   var q=document.getElementById('lfSearch'),risk=document.getElementById('lfRisk'),
       prio=document.getElementById('lfPrio'),eff=document.getElementById('lfEff'),
-      blk=document.getElementById('lfBlk'),srt=document.getElementById('lfSort');
+      blk=document.getElementById('lfBlk'),srt=document.getElementById('lfSort'),
+      stat=document.getElementById('lfStatus'),
+      tags=[].slice.call(document.querySelectorAll('#lfTags .tagtog'));
+  /* the tag pills multi-select, and every pressed one must hold — pinned +
+     unreviewed reads "pinned and not yet reviewed". Bit tags decode the same
+     bitmask data-tagrank the TAGS column sorts by; the review states read
+     data-reviewed. One attribute each, no rescans. */
+  var TAGBIT={blocked:8,decision:4,wip:2,pinned:1};
+  function tagOk(li){
+    var r=parseInt(li.getAttribute('data-tagrank'),10)||0,
+        rev=li.getAttribute('data-reviewed')==='y';
+    for(var i=0;i<tags.length;i++){
+      if(tags[i].getAttribute('aria-pressed')!=='true')continue;
+      var v=tags[i].getAttribute('data-tag');
+      if(v==='none'){if(r!==0)return false;}
+      else if(v==='rev-y'){if(!rev)return false;}
+      else if(v==='rev-n'){if(rev)return false;}
+      else if(!(r&TAGBIT[v]))return false;
+    }
+    return true;
+  }
   function apply(){
     var qs=q.value.trim().toLowerCase();
     document.querySelectorAll('.col').forEach(function(col){
@@ -1703,6 +1858,8 @@ LIST_FILTER_SCRIPT = """<script>
           &&(!prio.value||li.getAttribute('data-prio')===prio.value)
           &&(!eff.value||li.getAttribute('data-eff')===eff.value)
           &&(!blk.value||li.getAttribute('data-blocked')===blk.value)
+          &&(!stat||!stat.value||li.getAttribute('data-status')===stat.value)
+          &&tagOk(li)
           &&(!qs||li.getAttribute('data-search').indexOf(qs)!==-1);
         li.hidden=!ok; if(ok)shown++;
       });
@@ -1735,6 +1892,7 @@ LIST_FILTER_SCRIPT = """<script>
     else if(col==='num')      v=parseInt(li.getAttribute('data-num'),10);
     else if(col==='effh'){    var h=li.getAttribute('data-effh');
                               v=(h===''||h==null)?null:parseFloat(h);}
+    else if(col==='tags')     v=parseInt(li.getAttribute('data-tagrank'),10)||0;
     else if(col==='date'){    var d=(li.getAttribute('data-date')||'').replace(/-/g,'');
                               v=d?parseInt(d,10)*1e6+(parseInt(li.getAttribute('data-num'),10)||0):null;}
     else                      v=li.getAttribute('data-'+col)||'';   /* title, epic */
@@ -1774,7 +1932,7 @@ LIST_FILTER_SCRIPT = """<script>
   /* Column headers ARE the sort control on the grid. First click orders the way
      the column is usually read — newest/highest/most-urgent first, text A→Z —
      and a second click reverses it. */
-  var DESC_FIRST={num:1,date:1};
+  var DESC_FIRST={num:1,date:1,tags:1};
   var heads=[].slice.call(document.querySelectorAll('.g-head [data-sort]'));
   function markHeads(){
     heads.forEach(function(h){
@@ -1807,13 +1965,40 @@ LIST_FILTER_SCRIPT = """<script>
     else{sortCol=({risk:'risk',priority:'prio',effort:'effh'})[v];sortDir=1;}
     markHeads();applySort();
   });
-  [q,risk,prio,eff,blk].forEach(function(el){
+  [q,risk,prio,eff,blk,stat].filter(Boolean).forEach(function(el){
     el.addEventListener('input',apply);el.addEventListener('change',apply);});
+  /* a pressed tag pill excludes its contradictions: untagged clears the bit
+     tags (and vice versa), reviewed clears unreviewed (and vice versa) */
+  var TAGEXCL={none:'blocked decision wip pinned',blocked:'none',decision:'none',
+    wip:'none',pinned:'none','rev-y':'rev-n','rev-n':'rev-y'};
+  tags.forEach(function(b){b.addEventListener('click',function(){
+    var on=b.getAttribute('aria-pressed')!=='true';
+    if(on){var ex=(TAGEXCL[b.getAttribute('data-tag')]||'').split(' ');
+      tags.forEach(function(o){if(ex.indexOf(o.getAttribute('data-tag'))!==-1)
+        o.setAttribute('aria-pressed','false');});}
+    b.setAttribute('aria-pressed',on?'true':'false');apply();});});
   q.addEventListener('keydown',function(e){if(e.key==='Escape'){q.value='';apply();}});
   document.getElementById('lfClear').addEventListener('click',function(){
     q.value='';risk.value='';prio.value='';eff.value='';blk.value='';
-    if(srt)srt.value='';
+    if(srt)srt.value='';if(stat)stat.value='';
+    tags.forEach(function(b){b.setAttribute('aria-pressed','false');});
     sortCol=heads.length?'date':'';sortDir=-1;markHeads();applySort();apply();});
+  /* arriving from a canned link (?pinned=1, ?wip=1, ?blocked=y, ?risk=…): the
+     bar arrives already showing the state the server filtered by */
+  (function(){
+    var p={};location.search.slice(1).split('&').forEach(function(kv){
+      var i=kv.indexOf('=');if(i>0)p[kv.slice(0,i)]=decodeURIComponent(kv.slice(i+1));});
+    function press(tag){tags.forEach(function(b){
+      if(b.getAttribute('data-tag')===tag)b.setAttribute('aria-pressed','true');});}
+    if(p.pinned==='1')press('pinned');
+    if(p.wip==='1')press('wip');
+    if(p.quick==='1'){eff.value='s';blk.value='n';}
+    if(p.blocked==='y'||p.blocked==='n')blk.value=p.blocked;
+    if(p.risk)risk.value=p.risk.toUpperCase();
+    if(p.priority)prio.value=p.priority;
+    if(stat&&p.status&&p.status.indexOf(',')===-1)stat.value=p.status;
+    apply();
+  })();
   // epic chips sit inside ticket links; intercept and route to the epic page
   document.addEventListener('click',function(ev){
     var ch=ev.target.closest('.mchip[data-epic]');if(!ch)return;
@@ -1993,7 +2178,8 @@ def _li_attrs(t, date=""):
     m = _IDRE["ticket_split"].match(t["id"])
     return (' data-id="%s" data-num="%s" data-title="%s" data-epic="%s"'
             ' data-status="%s" data-risk="%s" data-prio="%s" data-eff="%s"'
-            ' data-effh="%s" data-blocked="%s" data-date="%s" data-search="%s"' % (
+            ' data-effh="%s" data-blocked="%s" data-date="%s" data-search="%s"'
+            ' data-tagrank="%d" data-reviewed="%s"' % (
                 html.escape(t["id"]), m.group(1) if m else "",
                 html.escape(t["title"].lower()), html.escape(t.get("epic") or ""),
                 html.escape(t.get("status") or ""),
@@ -2002,7 +2188,42 @@ def _li_attrs(t, date=""):
                 _effort_bucket(t.get("effortH")),
                 "" if t.get("effortH") is None else ("%g" % t["effortH"]),
                 "y" if t.get("blocked") else "n", html.escape(date),
-                html.escape((t["id"] + " " + t["title"]).lower())))
+                html.escape((t["id"] + " " + t["title"]).lower()),
+                sum(r for _n, r in _tags(t)),
+                "y" if t.get("reviewed") else "n"))
+
+
+# DECISION/CONCEPT tickets carry it in the title; same test the dashboard runs.
+_DECISION_RE = re.compile(r"DECISION|Decision:|CONCEPT")
+
+
+def _tags(t):
+    """(name, rank) tags on a ticket, heaviest first — blocked outranks a
+    decision outranks live work outranks a pin. Ranks are powers of two and the
+    sort key is their sum, so a blocked decision orders above a merely blocked
+    ticket and every combination keeps a distinct, sensible place."""
+    out = []
+    if t.get("blocked"):
+        out.append(("blocked", 8))
+    if _DECISION_RE.search(t.get("title") or ""):
+        out.append(("decision", 4))
+    if t.get("wip"):
+        out.append(("wip", 2))
+    if t.get("pinned"):
+        out.append(("pinned", 1))
+    return out
+
+
+def _review_chip(t):
+    """The code-review tick: a checkbox that persists per ticket (review.json).
+    Same in-place toggle pattern as the pin chip — the shared list script owns
+    the click."""
+    on = bool(t.get("reviewed"))
+    return ('<span class="mchip revchip%s" role="checkbox" tabindex="0"'
+            ' aria-checked="%s" data-review="%s"'
+            ' title="code reviewed — click to toggle">&#10003;</span>'
+            % (" on" if on else "", "true" if on else "false",
+               html.escape(t["id"], quote=True)))
 
 
 def _a_data(t):
@@ -2029,9 +2250,11 @@ def _grid_row(t, is_child, datekey, today, show_status):
         if d:
             age = '<span class="g-age">%dd</span>' % (today - d).days
     cells = [
-        '<span class="g-id">%s%s</span>' % (
+        '<span class="g-id">%s%s<button type="button" class="g-copy copy-one"'
+        ' data-copy="%s" title="copy %s">&#10697;</button></span>' % (
             '<span class="g-sub" title="sub-ticket">&#8627;</span>' if is_child else "",
-            html.escape(t["id"])),
+            html.escape(t["id"]),
+            html.escape(t["id"], quote=True), html.escape(t["id"])),
         '<span class="g-ttl">%s</span>' % html.escape(t["title"]),
         ('<span class="g-epic"><span class="mchip epic-link" role="link"'
          ' tabindex="0" data-epic="%s" title="open the __PFX__-%s epic page">'
@@ -2051,11 +2274,12 @@ def _grid_row(t, is_child, datekey, today, show_status):
         '<span class="g-eff">%s</span>' % html.escape(t.get("effort") or "—"),
         '<span class="g-date">%s%s</span>' % (html.escape(date or "—"), age),
         '<span class="g-flags">%s%s%s</span>' % (
-            '<span class="mchip blocked" title="blocked">&#9940;</span>'
-            if t.get("blocked") else "",
-            '<span class="mchip wip" title="modified in the working tree">WIP</span>'
-            if t.get("wip") else "",
-            _pin_chip(t["id"], bool(t.get("pinned")))),
+            "".join({"blocked": '<span class="mchip blocked" title="blocked">&#9940;</span>',
+                     "decision": '<span class="mchip dec" title="decision/concept ticket">DEC</span>',
+                     "wip": '<span class="mchip wip" title="modified in the working tree">WIP</span>',
+                     "pinned": ""}[name] for name, _r in _tags(t)),
+            _pin_chip(t["id"], bool(t.get("pinned"))),
+            _review_chip(t)),
     ]
     return ('<li%s><a class="g-row" href="/ticket/%s"%s>%s</a></li>'
             % (_li_attrs(t, date), html.escape(t["id"]), _a_data(t),
@@ -2082,7 +2306,7 @@ def _ticket_grid(items, datekey, today, show_status):
               ("g-eff", "58px", "EFFORT", "effh"),
               ("g-date", "116px", "CLOSED" if datekey == "closed" else "CREATED",
                "date"),
-              ("g-flags", "62px", "", "")]
+              ("g-flags", "104px", "TAGS", "tags")]
 
     rows = "".join(_grid_row(t, child, datekey, today, show_status)
                    for t, child in _epic_group(items, datekey, True))
@@ -2246,6 +2470,18 @@ font-family:var(--mono);font-size:.68rem;color:var(--mut);white-space:nowrap}
 .col-grid .g-risk.r-medium{color:var(--warn)}
 .col-grid .g-age{opacity:.65;margin-left:6px}
 .col-grid .g-flags{display:flex;gap:4px;justify-content:flex-end;align-items:center}
+/* the id cell's own copy button — there on hover, out of the way otherwise */
+.col-grid .g-copy{font:inherit;font-size:.78rem;border:0;background:none;color:var(--mut);
+cursor:pointer;padding:0 0 0 5px;line-height:1;opacity:0;vertical-align:-1px}
+.col-grid .g-row:hover .g-copy,.col-grid .g-copy:focus-visible{opacity:.7}
+.col-grid .g-copy:hover{color:var(--accent);opacity:1}
+.col-grid .mchip.dec{color:var(--warn)}
+/* the review tick: a real checkbox face, unmissable either way */
+.col-grid .mchip.revchip{cursor:pointer;color:var(--mut);opacity:.75;font-size:.82rem;
+line-height:1;border:1.5px solid var(--line);border-radius:5px;padding:2px 6px}
+.col-grid .mchip.revchip:hover{opacity:1;color:var(--done);border-color:var(--done)}
+.col-grid .mchip.revchip.on{color:var(--done);opacity:1;font-weight:800;border-color:var(--done);
+background:color-mix(in srgb,var(--done) 15%,transparent)}
 /* headings borrow the row's classes so they hide together — but not its looks */
 .col-grid .g-head span{color:var(--mut);background:none;font:inherit;text-align:left;
 padding:0;opacity:1}
@@ -2260,7 +2496,7 @@ padding:0;opacity:1}
 .col-grid .gh-sort[data-dir="-1"] .gh-arrow::before{content:"\\2193"}  /* descending */
 /* narrow: the nice-to-have columns step aside; id, title and the date never do */
 @media (max-width:1000px){
-  .col-grid .g-head,.col-grid .g-row{grid-template-columns:92px minmax(0,1fr) 96px 52px}
+  .col-grid .g-head,.col-grid .g-row{grid-template-columns:92px minmax(0,1fr) 96px 84px}
   .col-grid .g-epic,.col-grid .g-st,.col-grid .g-p,.col-grid .g-risk,.col-grid .g-eff{display:none}
 }
 """
@@ -2385,7 +2621,8 @@ def render_filter_page(data, q):
         "<span>effort <b>" + ("%g" % round(eff_d, 1)) + "d</b></span>"
         + "".join("<span>" + c + "</span>" for c in crit)
         + "</div></div>"
-        + list_filter_bar(sort_select=False)      # the grid's headers sort it
+        + list_filter_bar(sort_select=False,      # the grid's headers sort it
+                          status_select=True)
         + "<div class='cols' style='grid-template-columns:1fr'>" + grid + "</div>"
         + "</div>" + LIST_FILTER_SCRIPT + "</body></html>"
     )
@@ -2406,10 +2643,10 @@ DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 --warn:#b3781a;--shadow:0 1px 2px rgba(16,23,32,.06),0 8px 24px -12px rgba(16,23,32,.18);
 --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,sans-serif;
 --font-mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;--r:7px;}
-@media (prefers-color-scheme:dark){:root{--ground:#0b0f15;--surface:#141b25;--surface-2:#0f1620;
---ink:#e8edf3;--ink-2:#c2ccd6;--ink-mut:#8b98a6;--line:#26313e;--line-2:#1d2732;--accent:#6a8dff;
---accent-ink:#a9bdff;--accent-soft:#1c2740;--done:#48c483;--done-soft:#16311f;--wf:#69747f;
---wf-soft:#222c37;--warn:#d9a441;--shadow:0 1px 2px rgba(0,0,0,.4),0 12px 30px -14px rgba(0,0,0,.6);}}
+@media (prefers-color-scheme:dark){:root{--ground:#090e16;--surface:#151e2d;--surface-2:#101724;
+--ink:#edf2f9;--ink-2:#c6d2e0;--ink-mut:#8fa0b5;--line:#2a3a4d;--line-2:#202c3c;--accent:#6a8dff;
+--accent-ink:#a9bdff;--accent-soft:#1d2b4d;--done:#48c483;--done-soft:#143423;--wf:#75828f;
+--wf-soft:#243141;--warn:#d9a441;--shadow:0 1px 2px rgba(0,0,0,.4),0 12px 30px -14px rgba(0,0,0,.6);}}
 *{box-sizing:border-box}body{margin:0}
 .page{background:var(--ground);color:var(--ink);font-family:var(--font-sans);line-height:1.5;
 -webkit-font-smoothing:antialiased;padding:clamp(16px,4vw,44px) clamp(14px,4vw,32px) 64px;min-height:100vh}
@@ -2434,8 +2671,16 @@ text-decoration:none}
 .today-pocket .tp-new b{color:var(--accent-ink)}
 .today-pocket .tp-done b{color:var(--done)}
 .today-pocket .tp-item:hover{color:var(--accent-ink)}
-h1{font-size:clamp(1.9rem,4.4vw,2.9rem);line-height:1.02;letter-spacing:-.03em;font-weight:800;margin:.28em 0 0;text-wrap:balance}
-.tagline{font-size:clamp(1rem,2vw,1.16rem);color:var(--ink-2);margin:.7em 0 0;max-width:62ch}
+h1{font-size:clamp(1.9rem,4.4vw,2.9rem);line-height:1.02;letter-spacing:-.03em;font-weight:800;margin:.28em 0 0;
+display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+/* the header quote: quiet, italic, right-aligned on the project-name line */
+.h-quote{margin-left:auto;font-size:.84rem;font-weight:400;font-style:italic;letter-spacing:0;
+color:var(--ink-mut);text-align:right;max-width:46ch;line-height:1.5;align-self:center}
+.h-quote .q-by{font-style:normal;font-size:.9em;color:var(--ink-2);white-space:nowrap}
+@media (max-width:860px){.h-quote{display:none}}
+/* one line on a desktop; narrow screens get to wrap rather than overflow */
+.tagline{font-size:clamp(1rem,2vw,1.16rem);color:var(--ink-2);margin:.7em 0 0;white-space:nowrap}
+@media (max-width:980px){.tagline{white-space:normal;max-width:62ch}}
 .tagline b{color:var(--ink);font-weight:600}
 .stamp{font-family:var(--font-mono);font-size:.72rem;color:var(--ink-mut);border:1px solid var(--line);
 border-radius:100px;padding:5px 11px;white-space:nowrap;display:inline-flex;gap:7px;align-items:center}
@@ -2458,8 +2703,8 @@ color:#fff;border:0;border-radius:100px;padding:8px 16px;cursor:pointer;display:
 .legend .li{display:flex;align-items:center;gap:8px;font-size:.86rem;color:var(--ink-2)}
 .legend .sw{width:11px;height:11px;border-radius:3px;flex:none}
 .legend .n{font-family:var(--font-mono);color:var(--ink);font-weight:600}
-.kpis{display:grid;gap:12px;margin-top:16px;grid-template-columns:repeat(4,1fr)}
-.kpi{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px 18px;
+.kpis{display:grid;gap:13px;margin-top:17px;grid-template-columns:repeat(4,1fr)}
+.kpi{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:17px 19px;
 display:flex;flex-direction:column;gap:3px;position:relative}
 .kpi .k-val{font-family:var(--font-sans);font-size:clamp(1.5rem,3.2vw,2rem);font-weight:750;letter-spacing:-.02em;line-height:1;display:flex;align-items:baseline;gap:8px}
 .k-delta{font-family:var(--font-mono);font-size:.72rem;font-weight:600;letter-spacing:0}
@@ -2506,17 +2751,17 @@ color:var(--ink-mut);padding:5px 12px;border-radius:100px;cursor:pointer}
 .e-counts .cc{display:flex;gap:6px;justify-content:flex-end}.e-counts b{font-weight:700}
 .cc-open b{color:var(--accent-ink)}.cc-done b{color:var(--done)}.cc-wf b{color:var(--ink-mut)}
 .cc.zero{opacity:.4}
-.tracks{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-.track{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:15px 16px}
+.tracks{display:grid;grid-template-columns:repeat(3,1fr);gap:13px}
+.track{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px 17px}
 .track .t-val{font-family:var(--font-mono);font-size:1.5rem;font-weight:700;line-height:1}
 .track .t-lab{font-size:.82rem;color:var(--ink-2);margin-top:5px}
 .track .t-list{font-family:var(--font-mono);font-size:.7rem;color:var(--ink-mut);margin-top:7px;line-height:1.7}
-.backlog{columns:3 310px;column-gap:14px} /* masonry: cards pack, no row gaps */
+.backlog{columns:3 310px;column-gap:15px} /* masonry: cards pack, no row gaps */
 .bcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden;
-break-inside:avoid;margin:0 0 14px;display:block}
+break-inside:avoid;margin:0 0 15px;display:block}
 .bcard.span-all{column-span:all}
 .bcard.hl{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),var(--shadow)}
-.bcard>summary{list-style:none;cursor:pointer;padding:13px 15px;display:flex;align-items:center;gap:10px;border-bottom:1px solid transparent}
+.bcard>summary{list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:11px;border-bottom:1px solid transparent}
 .bcard[open]>summary{border-bottom-color:var(--line-2)}.bcard>summary::-webkit-details-marker{display:none}
 .b-caret{color:var(--ink-mut);font-family:var(--font-mono);font-size:.7rem;transition:transform .15s;flex:none}
 .bcard[open] .b-caret{transform:rotate(90deg)}
@@ -2524,13 +2769,14 @@ break-inside:avoid;margin:0 0 14px;display:block}
 .b-head-name{font-size:.9rem;font-weight:600;letter-spacing:-.01em;display:block;margin-top:1px}
 .b-count{font-family:var(--font-mono);font-size:.78rem;font-weight:700;color:var(--accent-ink);flex:none}
 .b-count small{color:var(--ink-mut);font-weight:400}
-.b-list{list-style:none;margin:0;padding:6px 6px 10px}
-.b-list li{padding:0}
-.b-list a{display:flex;flex-wrap:wrap;gap:4px 9px;padding:7px 9px;border-radius:5px;align-items:baseline;text-decoration:none;color:inherit}
+.b-list{list-style:none;margin:0;padding:7px 8px 11px}
+.b-list li{padding:0;border-bottom:1px solid var(--line-2,var(--line))}
+.b-list li:last-child{border-bottom:0}
+.b-list a{display:flex;gap:10px;padding:9px 11px;border-radius:5px;align-items:flex-start;text-decoration:none;color:inherit}
 .b-list a:hover{background:var(--surface-2)}
 .b-list a:hover .b-ttl{color:var(--accent-ink)}
 .b-tid{font-family:var(--font-mono);font-size:.72rem;color:var(--ink-mut);flex:none;min-width:80px}
-.b-ttl{font-size:.84rem;color:var(--ink-2);line-height:1.35;flex:1 1 55%;min-width:0}
+.b-ttl{font-size:.84rem;color:var(--ink-2);line-height:1.35;flex:1 1 auto;min-width:0}
 .b-dec{font-family:var(--font-mono);font-size:.58rem;letter-spacing:.05em;color:var(--warn);border:1px solid var(--warn);border-radius:3px;padding:0 4px;margin-left:6px;white-space:nowrap}
 .b-status{font-family:var(--font-mono);font-size:.62rem;letter-spacing:.04em;text-transform:uppercase;padding:2px 7px;border-radius:4px;flex:none}
 .backlog-tools{display:flex;gap:10px;align-items:center}
@@ -2538,6 +2784,27 @@ break-inside:avoid;margin:0 0 14px;display:block}
 .lnk:hover{text-decoration:underline}
 footer{margin-top:44px;border-top:1px solid var(--line);padding-top:18px;color:var(--ink-mut);font-size:.8rem}
 footer .mono{color:var(--ink-2)}footer p{margin:.4em 0}
+/* the launch / stop commands: one quiet line, click to copy — with the ⚙
+   settings drop-up right-aligned across from them */
+.foot-cmds{display:flex;gap:10px;align-items:center}
+.foot-cmds>button,.foot-cmds>span[aria-hidden],.fc-set>button{opacity:.7}
+.foot-cmds>button:hover,.fc-set>button:hover{opacity:1}
+.foot-cmds button{font-family:var(--font-mono);font-size:.68rem;color:var(--ink-mut);
+background:none;border:0;padding:0;cursor:pointer}
+.foot-cmds button:hover{color:var(--accent-ink)}
+.fc-set{margin-left:auto;position:relative}
+.setpanel{position:absolute;bottom:calc(100% + 10px);right:0;z-index:60;width:min(300px,86vw);
+display:block;background:var(--surface);border:1px solid var(--line);border-radius:10px;
+box-shadow:var(--shadow);padding:10px 12px;text-align:left}
+.setpanel[hidden]{display:none}
+.sp-h{display:block;font-family:var(--font-mono);font-size:.62rem;letter-spacing:.1em;
+text-transform:uppercase;color:var(--ink-mut);margin-bottom:7px}
+.sp-row{display:flex;gap:9px;align-items:flex-start;padding:6px 4px;cursor:pointer;border-radius:6px}
+.sp-row:hover{background:var(--surface-2)}
+.sp-row input{accent-color:var(--accent);margin:2px 0 0;cursor:pointer;flex:none}
+.sp-txt{display:block;min-width:0}
+.sp-lab{display:block;font-size:.8rem;font-weight:600;color:var(--ink)}
+.sp-note{display:block;font-size:.7rem;color:var(--ink-mut);margin-top:1px}
 a{color:var(--accent-ink)}:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
 @media (max-width:720px){.kpis{grid-template-columns:repeat(2,1fr)}.tracks{grid-template-columns:1fr}
 .erow{grid-template-columns:1fr;gap:8px}.e-counts{flex-direction:row;gap:14px;text-align:left}}
@@ -2547,9 +2814,9 @@ a{color:var(--accent-ink)}:focus-visible{outline:2px solid var(--accent);outline
 @media (prefers-color-scheme:dark){:root{--c-created:#3987e5;--c-closed:#199e70}}
 :root[data-theme="light"]{--c-created:#2b53e6;--c-closed:#2f9e5b}
 :root[data-theme="dark"]{--c-created:#3987e5;--c-closed:#199e70}
-.charts{display:grid;gap:16px;margin-top:16px}
+.charts{display:grid;gap:17px;margin-top:17px}
 @media (min-width:880px){.charts{grid-template-columns:1fr 1fr}}
-.chart{margin:0;background:var(--surface);border:1px solid var(--line);border-radius:calc(var(--r) + 2px);box-shadow:var(--shadow);padding:14px 16px 12px}
+.chart{margin:0;background:var(--surface);border:1px solid var(--line);border-radius:calc(var(--r) + 2px);box-shadow:var(--shadow);padding:15px 17px 13px}
 .chart-cap{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:8px}
 .chart-title{font-size:.86rem;font-weight:600;letter-spacing:-.01em}
 a.chart-title{color:inherit;text-decoration:none}
@@ -2580,16 +2847,32 @@ transition:opacity .1s;white-space:nowrap;z-index:6;transform:translate(-50%,-11
 .ctip .k{color:var(--ink-mut)}
 .chart-empty{color:var(--ink-mut);font-size:.82rem;padding:34px 12px;text-align:center}
 .sortlab{font-family:var(--font-mono);font-size:.72rem;color:var(--ink-mut);display:flex;align-items:center;gap:6px}
-.sortsel{font-family:var(--font-mono);font-size:.72rem;color:var(--ink);background:var(--surface-2);border:1px solid var(--line);border-radius:7px;padding:5px 9px;cursor:pointer}
+.sortsel{font-family:var(--font-mono);font-size:.72rem;color:var(--ink);background:var(--surface-2);border:1px solid var(--line);border-radius:7px;padding:5px 24px 5px 10px;cursor:pointer;
+appearance:none;-webkit-appearance:none;
+background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M1 1l3 3 3-3' fill='none' stroke='%237d8894' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+background-repeat:no-repeat;background-position:right 9px center}
+.sortsel:hover{border-color:var(--accent)}
 .b-toggle{display:inline-flex;border:1px solid var(--line);border-radius:100px;overflow:hidden;flex:none}
 .b-toggle button{font-family:var(--font-mono);font-size:.62rem;letter-spacing:.02em;border:0;background:var(--surface-2);color:var(--ink-mut);padding:3px 10px;cursor:pointer}
 .b-toggle button[aria-pressed="true"]{background:var(--accent);color:#fff}
 .b-date{font-family:var(--font-mono);font-size:.68rem;color:var(--ink-mut);flex:none;white-space:nowrap}
 .b-list a.closed .b-tid{color:var(--done)}
 .b-list a.closed .b-ttl{color:var(--ink-mut)}
-.b-right{margin-left:auto;display:inline-flex;gap:8px;align-items:baseline;padding-left:10px;flex:none}
-.b-metas{display:inline-flex;gap:4px}
-.b-meta{font-family:var(--font-mono);font-size:.6rem;letter-spacing:.02em;border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--ink-mut);white-space:nowrap}
+/* card row anatomy: a body (title line, then a right-aligned chip line with a
+   little air between them) and a rail down the right edge — review tick on
+   top, the one pin toggle directly beneath it */
+.b-body{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:7px}
+.b-line1{display:flex;gap:10px;align-items:baseline;min-width:0}
+.b-right{display:flex;gap:7px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
+.b-rail{display:flex;flex-direction:column;gap:6px;align-items:center;flex:none;align-self:stretch}
+.b-rail .pinchip{margin-top:auto} /* tick rides the title line; the pin anchors
+   to the row's bottom edge, so the bottom row reads uniform card to card */
+.b-metas{display:inline-flex;gap:7px;align-items:center}
+/* informational tags lie flat on a quiet fill; interactive ones (.act and the
+   review tick) carry a real border and a hover — you can press those */
+.b-meta{font-family:var(--font-mono);font-size:.6rem;letter-spacing:.02em;border:1px solid transparent;border-radius:4px;padding:2px 6px;color:var(--ink-mut);white-space:nowrap;background:var(--surface-2)}
+.b-meta.act{border-color:var(--line);background:var(--surface);cursor:pointer}
+.b-meta.act:hover{border-color:var(--accent);color:var(--accent-ink)}
 .b-meta.r-high{color:#c23b3b;border-color:#c23b3b}
 .b-meta.r-medium{color:var(--warn);border-color:var(--warn)}
 .b-meta.r-low{color:var(--done);border-color:var(--done)}
@@ -2599,9 +2882,8 @@ transition:opacity .1s;white-space:nowrap;z-index:6;transform:translate(-50%,-11
 .sortlab.chk{cursor:pointer;user-select:none}
 .sortlab.chk input{accent-color:var(--accent);margin:0 2px 0 0;cursor:pointer}
 .backlog-tools{flex-wrap:wrap;row-gap:8px}
-.recent{background:var(--surface);border:1px solid var(--line);border-radius:calc(var(--r) + 2px);box-shadow:var(--shadow);padding:6px 10px}
-.recent a{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;padding:9px 10px;border-radius:5px;text-decoration:none;color:inherit;border-bottom:1px solid var(--line-2)}
-.recent .b-ttl{flex:1 1 45%}
+.recent{background:var(--surface);border:1px solid var(--line);border-radius:calc(var(--r) + 2px);box-shadow:var(--shadow);padding:7px 11px}
+.recent a{display:flex;gap:10px;align-items:flex-start;padding:10px 11px;border-radius:5px;text-decoration:none;color:inherit;border-bottom:1px solid var(--line-2)}
 .recent a:last-of-type{border-bottom:0}
 .recent a:hover{background:var(--surface-2)}
 .recent a:hover .b-ttl{color:var(--accent-ink)}
@@ -2610,7 +2892,7 @@ transition:opacity .1s;white-space:nowrap;z-index:6;transform:translate(-50%,-11
 .kpi.clickable{cursor:pointer}
 .kpi.clickable:hover{border-color:var(--accent)}
 @media (max-width:640px){.b-right{display:none}}
-/* priority × risk matrix — ordinal blue ramp, validated (light on #fff, dark on #141b25) */
+/* priority × risk matrix — ordinal blue ramp, validated (light on #fff, dark on #151e2d) */
 :root{--mx-1:#86b6ef;--mx-2:#5598e7;--mx-3:#2a78d6;--mx-4:#1c5cab}
 @media (prefers-color-scheme:dark){:root{--mx-1:#184f95;--mx-2:#256abf;--mx-3:#3987e5;--mx-4:#86b6ef}}
 .matrix{display:grid;grid-template-columns:auto repeat(3,1fr);gap:2px;margin-top:6px}
@@ -2633,7 +2915,7 @@ gap:1px;background:var(--surface-2);border:0;cursor:pointer;font-family:inherit;
 .mx-cell.s3{background:var(--mx-3);color:#fff}.mx-cell.s4{background:var(--mx-4);color:#fff}
 @media (prefers-color-scheme:dark){
 .mx-cell.s1,.mx-cell.s2,.mx-cell.s3{color:#fff}
-.mx-cell.s4{background:var(--mx-4);color:#0b0f15}}
+.mx-cell.s4{background:var(--mx-4);color:#090e16}}
 /* the ramp inverts by mode (dark bg -> brighter = more), so the legend must too */
 .mx-legend .dm{display:none}
 @media (prefers-color-scheme:dark){.mx-legend .lm{display:none}.mx-legend .dm{display:inline}}
@@ -2656,18 +2938,40 @@ a.ebar-row:hover .ebr-name{color:var(--accent-ink)}
 .ebr-bar{height:14px;border-radius:0 4px 4px 0;background:var(--accent);flex:none}
 .ebr-val{font-family:var(--font-mono);font-size:.68rem;color:var(--ink-mut);white-space:nowrap}
 /* up-next planning list + two-panel recent activity */
-.duo{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.duo{display:grid;grid-template-columns:1fr 1fr;gap:15px}
 @media (max-width:880px){.duo{grid-template-columns:1fr}}
 .panel-h{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-mut);
-padding:10px 14px;border-bottom:1px solid var(--line-2);background:var(--surface-2)}
-.recent{padding:0 10px 6px}
-.recent .panel-h{margin:0 -10px 4px;border-radius:calc(var(--r) + 2px) calc(var(--r) + 2px) 0 0}
-.panel-h.ph-tools{display:flex;align-items:center;gap:10px}
-.upnext .b-meta.why{color:var(--accent-ink);border-color:var(--accent-ink)}
-.b-meta.blocked{color:var(--warn);border-color:var(--warn)}
-.b-meta.unblocks{color:var(--accent-ink);border-color:var(--accent-ink)}
-/* dependency chip: present but quiet, until you go looking for it */
-.b-meta.dep{border-color:transparent;color:var(--ink-mut);opacity:.42;cursor:pointer;padding:1px 3px}
+padding:11px 15px;border-bottom:1px solid var(--line-2);background:var(--surface-2)}
+.recent{padding:0 11px 7px}
+.recent .panel-h{margin:0 -11px 5px;border-radius:calc(var(--r) + 2px) calc(var(--r) + 2px) 0 0}
+.panel-h.ph-tools{display:flex;align-items:center;gap:11px}
+/* a panel heading that IS a link: same face, an arrow on hover says it goes */
+.ph-link{color:inherit;text-decoration:none}
+.ph-link:hover{color:var(--accent-ink)}
+.ph-link:hover::after{content:" \\2197"}
+.upnext .b-meta.why{color:var(--accent-ink)}
+.b-meta.blocked{color:var(--warn)}
+.b-meta.unblocks{color:var(--accent-ink)}
+/* the rail chips: the review tick (a checkbox face loud enough to be part of
+   the workflow) with the one pin toggle directly beneath it — same square
+   footprint so the rail reads as a column of controls */
+.b-meta.revchip,.b-meta.pinchip{cursor:pointer;width:22px;height:22px;padding:0;
+display:inline-flex;align-items:center;justify-content:center;
+border:1.5px solid var(--line);border-radius:5px;background:var(--surface)}
+.b-meta.revchip{opacity:.85;font-size:.78rem}
+.b-meta.revchip:hover{color:var(--done);border-color:var(--done);opacity:1}
+.b-meta.revchip.on{color:var(--done);border-color:var(--done);font-weight:800;opacity:1;
+background:color-mix(in srgb,var(--done) 15%,transparent)}
+.b-meta.pinchip{font-size:.72rem;filter:grayscale(1);opacity:.45}
+.b-meta.pinchip:hover{opacity:.9;border-color:var(--warn)}
+.b-meta.pinchip.on{filter:none;opacity:1;border-color:var(--warn);
+background:color-mix(in srgb,var(--warn) 12%,transparent)}
+.b-meta.pinchip.on:hover{border-color:#c23b3b;filter:grayscale(1)}
+/* dependency chip: quiet until you go looking for it — a square, like the tick.
+   It leads the chip line from the card's far left, away from the tags */
+.b-meta.dep{border-color:transparent;color:var(--ink-mut);opacity:.42;cursor:pointer;font-size:.78rem;
+width:22px;height:22px;padding:0;display:inline-flex;align-items:center;justify-content:center}
+.b-right .b-meta.dep{margin-right:auto}
 .b-list a:hover .b-meta.dep{opacity:.85}
 .b-meta.dep:hover,.b-meta.dep:focus-visible{opacity:1;color:var(--accent-ink);border-color:var(--accent-ink)}
 /* chart table view */
@@ -2712,14 +3016,18 @@ justify-content:center;gap:2px;text-decoration:none;padding:8px 4px}
 .age-cell .d{font-family:var(--font-mono);font-size:.64rem;opacity:.85}
 .age-cell.s1{background:var(--mx-1);color:#101720}.age-cell.s2{background:var(--mx-2);color:#101720}
 .age-cell.s3{background:var(--mx-3);color:#fff}.age-cell.s4{background:var(--mx-4);color:#fff}
-@media (prefers-color-scheme:dark){.age-cell.s1,.age-cell.s2,.age-cell.s3{color:#fff}.age-cell.s4{color:#0b0f15}}
+@media (prefers-color-scheme:dark){.age-cell.s1,.age-cell.s2,.age-cell.s3{color:#fff}.age-cell.s4{color:#090e16}}
 .age-cell.zero{background:var(--surface-2);color:var(--ink-mut)}
 .b-meta.wip{color:var(--accent-ink);border-color:var(--accent-ink);font-weight:600}
 .e-emo{flex:none}
 .b-emo{flex:none;font-size:1rem}
 .g-emo{flex:none}
 /* github button + latest activity + adr search + dep graph + epic tiles */
-.head-btns{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap}
+/* single-interface header: pocket + GitHub ride beside the eyebrow; the
+   utility cluster (links, notes, regenerate) right-aligns. In hub mode the
+   bar relocates the left group, and what remains packs right. */
+.head-btns{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap;flex:1 1 auto;justify-content:flex-end}
+.head-btns .ghbtn{margin-right:auto}
 /* notes / to-do pop-out */
 .tag-row{display:flex;align-items:center;justify-content:space-between;gap:10px 14px;flex-wrap:wrap;margin-top:.7em}
 .tag-row .tagline{margin:0}
@@ -2854,15 +3162,12 @@ border-radius:9px;padding:12px 12px 11px;text-decoration:none;color:inherit;posi
 .etile .e-chip{position:absolute;top:10px;right:10px}
 /* pinned + wip strip at the top */
 .topstrip{margin-top:16px}
-.topstrip .b-ttl{flex:1 1 40%}
-.topstrip .g-kind{align-self:center}
 .topstrip.solo{grid-template-columns:1fr}
 .pin-x{font-family:var(--font-mono);font-size:.66rem;border:1px solid var(--line);background:var(--surface-2);
 color:var(--ink-mut);border-radius:5px;padding:2px 7px;cursor:pointer;flex:none}
 .pin-x:hover{border-color:#c23b3b;color:#c23b3b}
-.b-meta.pinned{color:var(--warn);border-color:var(--warn)}
-.b-meta.pinned[data-unpin]{cursor:pointer}
-.b-meta.pinned[data-unpin]:hover,.b-meta.pinned[data-unpin]:focus-visible{color:#c23b3b;border-color:#c23b3b;text-decoration:line-through}
+#pinnedList a[data-pin-key]{cursor:grab}
+#pinnedList a.pin-drag{opacity:.45}
 /* collapsible sections */
 .sec-tgl{font-family:var(--font-mono);font-size:.8rem;border:1px solid var(--line);background:var(--surface);
 color:var(--ink-mut);border-radius:6px;width:26px;height:26px;cursor:pointer;line-height:1;padding:0;flex:none;align-self:center}
@@ -2889,7 +3194,7 @@ section.collapsed .sec-head{margin-bottom:0}
         <button class="regen" id="regen" type="button"><span class="ic">&#8635;</span> Regenerate</button>
       </span>
     </div>
-    <h1>__BRAND__ <span class="h-emo" aria-hidden="true">__HDR_ICON__</span></h1>
+    <h1>__BRAND__ <span class="h-emo" aria-hidden="true">__HDR_ICON__</span>__QUOTE__</h1>
     <div class="tag-row">
       <p class="tagline" id="tagline">Scanning tickets&hellip;</p>
     </div>
@@ -2948,8 +3253,8 @@ section.collapsed .sec-head{margin-bottom:0}
     <div class="kpi clickable" data-href="/filter?status=open&quick=1&label=Ready%20quick%20wins" title="Open, unblocked, and estimated at four hours or less. Click for the list."><span class="k-val" id="k-quick">&mdash;</span><span class="k-lab">Ready quick wins</span><span class="k-sub" id="k-quick-sub">&nbsp;</span></div>
   </div>
   <div class="duo topstrip" id="topstrip">
-    <div class="recent" id="pinnedPanel"><div class="panel-h ph-tools">&#128278; Pinned &middot; watching<span class='list-tools' data-src='#pinnedList' data-name='pinned'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="pinnedList"></div></div>
-    <div class="recent" id="wipPanel"><div class="panel-h ph-tools">&#128295; Work in progress &middot; git working tree<span class='list-tools' data-src='#wipList' data-name='wip'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="wipList"></div></div>
+    <div class="recent" id="pinnedPanel"><div class="panel-h ph-tools"><a class="ph-link" href="/filter?pinned=1&amp;label=Pinned" title="Open as a sortable list">&#128278; Pinned &middot; watching</a><span class='list-tools' data-src='#pinnedList' data-name='pinned' data-sort='1'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-unpin' title='Unpin everything in this list'>unpin all</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="pinnedList"></div></div>
+    <div class="recent" id="wipPanel"><div class="panel-h ph-tools"><a class="ph-link" href="/filter?wip=1&amp;label=Work%20in%20progress" title="Open as a sortable list">&#128295; Work in progress &middot; git working tree</a><span class='list-tools' data-src='#wipList' data-name='wip' data-sort='1'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-pin' title='Pin every ticket in this list'>pin all</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="wipList"></div></div>
   </div>
   <section id="sec-health">
     <div class="sec-head"><h2><span class="h-num">01</span>Program health</h2>
@@ -3018,7 +3323,7 @@ section.collapsed .sec-head{margin-bottom:0}
       </figure>
     </div>
     <div class="recent upnext" style="margin-top:14px">
-      <div class="panel-h ph-tools">Up next &mdash; unblocked, ranked by priority &middot; unblocks &middot; effort<span class='list-tools' data-src='#upnextList' data-name='up-next'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span></div>
+      <div class="panel-h ph-tools"><a class="ph-link" href="/filter?status=open&amp;blocked=n&amp;label=Up%20next%20%E2%80%94%20unblocked" title="Open as a sortable list">Up next &mdash; unblocked, ranked by priority &middot; unblocks &middot; effort</a><span class='list-tools' data-src='#upnextList' data-name='up-next' data-sort='1'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-pin' title='Pin every ticket in this list'>pin all</button><button type='button' class='lt-csv'>CSV</button></span></div>
       <div id="upnextList"></div>
     </div>
   </section>
@@ -3032,8 +3337,8 @@ section.collapsed .sec-head{margin-bottom:0}
     </div>
     <p class="sec-note">The latest closes and the newest tickets, across every epic.</p>
     <div class="duo">
-      <div class="recent"><div class="panel-h ph-tools">Recently closed<span class='list-tools' data-src='#recentList' data-name='recently-closed'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="recentList"></div></div>
-      <div class="recent"><div class="panel-h ph-tools">Recently created &middot; still open<span class='list-tools' data-src='#createdList' data-name='recently-created'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="createdList"></div></div>
+      <div class="recent"><div class="panel-h ph-tools">Recently closed<span class='list-tools' data-src='#recentList' data-name='recently-closed' data-sort='1'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-pin' title='Pin every ticket in this list'>pin all</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="recentList"></div></div>
+      <div class="recent"><div class="panel-h ph-tools">Recently created &middot; still open<span class='list-tools' data-src='#createdList' data-name='recently-created' data-sort='1'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-pin' title='Pin every ticket in this list'>pin all</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="createdList"></div></div>
     </div>
   </section>
   <section id="sec-backlog">
@@ -3072,12 +3377,25 @@ section.collapsed .sec-head{margin-bottom:0}
             <option value="n">unblocked</option>
           </select>
         </label>
+        <label class="sortlab">tags
+          <select id="fTag" class="sortsel">
+            <option value="">all</option>
+            <option value="blocked">blocked</option>
+            <option value="decision">decision</option>
+            <option value="wip">wip</option>
+            <option value="pinned">pinned</option>
+            <option value="none">untagged</option>
+            <option value="rev-y">reviewed &#10003;</option>
+            <option value="rev-n">not reviewed</option>
+          </select>
+        </label>
         <label class="sortlab">tickets
           <select id="tSort" class="sortsel">
             <option value="date">by date</option>
             <option value="risk">by risk</option>
             <option value="priority">by priority</option>
             <option value="effort">by effort</option>
+            <option value="tags">by tags</option>
           </select>
         </label>
         <label class="sortlab">epics
@@ -3094,7 +3412,7 @@ section.collapsed .sec-head{margin-bottom:0}
         </label>
         <button type="button" class="lnk" id="expandAll">expand all</button>
         <button type="button" class="lnk" id="collapseAll">collapse all</button>
-        <span class='list-tools' data-src='#backlog' data-name='backlog'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-csv'>CSV</button></span>
+        <span class='list-tools' data-src='#backlog' data-name='backlog'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-pin' title='Pin every ticket in this list'>pin all</button><button type='button' class='lt-csv'>CSV</button></span>
       </div>
     </div>
     <p class="sec-note">Every epic with tickets. Toggle each card between <b>open</b> and <b>closed</b>; click a ticket to open its YAML + body. Open tickets list oldest first, closed list newest first. <span style="color:var(--warn)">DECISION</span> tickets are flagged; active working-tree work is highlighted.</p>
@@ -3123,6 +3441,10 @@ section.collapsed .sec-head{margin-bottom:0}
   <footer>
     <p><span class="mono">Live scan</span> of <span class="mono" id="foot-src">tickets/</span> frontmatter &mdash; counts every ticket file (<span class="mono">id: __PFX__-####</span>), including compound sub-tickets, so totals reflect real files on disk rather than the generated index.</p>
     <p><span class="mono" id="foot-time">&nbsp;</span></p>
+    <p class="foot-cmds"><button type="button" class="copy-one" data-copy="interfacile hub"
+      title="launch the hub — click to copy">interfacile hub</button><span aria-hidden="true">&middot;</span>
+      <button type="button" class="copy-one" data-copy="interfacile stop --all"
+      title="stop every interfacile server — click to copy">interfacile stop --all</button>__SETTINGS__</p>
     __THEME_PICKER__
   </footer>
 </div></div>
@@ -3130,7 +3452,7 @@ section.collapsed .sec-head{margin-bottom:0}
 (function(){
   "use strict";
   var STATE={data:null,sort:"open",backlogSort:"recentClosed",tSort:"date",
-             fRisk:"",fPrio:"",fEff:"",fBlk:"",q:"",recentN:3,meterMode:"tickets",
+             fRisk:"",fPrio:"",fEff:"",fBlk:"",fTag:"",q:"",recentN:3,meterMode:"tickets",
              bucket:"week",tvBu:false,tvTp:false,showEmpty:false};
   var cardViews={};
   var cardOpen={};
@@ -3146,6 +3468,16 @@ section.collapsed .sec-head{margin-bottom:0}
     if(STATE.fEff&&effBucket(t)!==STATE.fEff)return false;
     if(STATE.fBlk==="y"&&!t.blocked)return false;
     if(STATE.fBlk==="n"&&t.blocked)return false;
+    if(STATE.fTag){
+      var tv=STATE.fTag,dec=/DECISION|Decision:|CONCEPT/.test(t.title);
+      if(tv==="blocked"&&!t.blocked)return false;
+      if(tv==="decision"&&!dec)return false;
+      if(tv==="wip"&&!t.wip)return false;
+      if(tv==="pinned"&&!t.pinned)return false;
+      if(tv==="none"&&(t.blocked||dec||t.wip||t.pinned))return false;
+      if(tv==="rev-y"&&!t.reviewed)return false;
+      if(tv==="rev-n"&&t.reviewed)return false;
+    }
     return true;
   }
   function sortTickets(arr){
@@ -3155,23 +3487,47 @@ section.collapsed .sec-head{margin-bottom:0}
     if(s==="risk")arr.sort(function(a,b){return (RISK_ORD[a.risk]!=null?RISK_ORD[a.risk]:9)-(RISK_ORD[b.risk]!=null?RISK_ORD[b.risk]:9);});
     else if(s==="priority")arr.sort(function(a,b){return (parseInt(a.priority,10)||9)-(parseInt(b.priority,10)||9);});
     else if(s==="effort")arr.sort(function(a,b){return (a.effortH==null?1e9:a.effortH)-(b.effortH==null?1e9:b.effortH);});
+    else if(s==="tags")arr.sort(function(a,b){return tagRank(b)-tagRank(a);});
     return arr;
   }
   function metaBadges(t,withEpic){
+    /* informational tags lie flat; interactive ones (class `act`, plus the
+       review tick rendered separately at the row's corner) look pressable */
     var out="";
-    if(withEpic&&t.epic)out+='<span class="b-meta epic-link" role="link" tabindex="0" data-epic="'+esc(t.epic)+
+    if(withEpic&&t.epic)out+='<span class="b-meta act epic-link" role="link" tabindex="0" data-epic="'+esc(t.epic)+
       '" title="open the '+esc(t.epic)+' epic page">'+esc(t.epic)+'</span>';
-    if(t.pinned)out+='<span class="b-meta pinned" role="button" tabindex="0" data-unpin="'+esc(t.id)+
-      '" title="pinned — click to unpin">&#128278;</span>';
     if(t.wip)out+='<span class="b-meta wip" title="file modified in the git working tree">WIP</span>';
     if(t.risk)out+='<span class="b-meta r-'+t.risk.toLowerCase()+'" title="risk '+esc(t.risk)+'">'+esc(t.risk[0])+'</span>';
     if(t.priority)out+='<span class="b-meta" title="priority '+esc(String(t.priority))+'">P'+esc(String(t.priority))+'</span>';
     if(t.effort)out+='<span class="b-meta" title="effort estimate">'+esc(t.effort)+'</span>';
     if(t.blocked)out+='<span class="b-meta blocked" title="depends on an open ticket">blocked</span>';
     if(t.unblocks)out+='<span class="b-meta unblocks" title="open tickets this one is holding up">unblocks '+t.unblocks+'</span>';
-    if(DEPIDS[t.id])out+='<span class="b-meta dep" role="link" tabindex="0" data-dep="'+esc(t.id)+
-      '" title="trace this ticket\'s dependencies">&#9741;</span>';
     return out?'<span class="b-metas">'+out+'</span>':"";
+  }
+  function depChip(t){
+    /* leads the chip line from the card's other side, apart from the tags */
+    return DEPIDS[t.id]?'<span class="b-meta act dep" role="link" tabindex="0" data-dep="'+esc(t.id)+
+      '" title="trace this ticket\'s dependencies">&#9741;</span>':"";
+  }
+  function revChip(t){
+    return '<span class="b-meta revchip'+(t.reviewed?' on':'')+'" role="checkbox" tabindex="0"'+
+      ' aria-checked="'+(t.reviewed?'true':'false')+'" data-review="'+esc(t.id)+
+      '" title="code reviewed — click to toggle">&#10003;</span>';
+  }
+  function pinChip(t){
+    /* the rail's one pin control: pins when off, unpins when on */
+    var key=t.doc||t.id,on=!!(t.pinned||t.doc);
+    return '<span class="b-meta pinchip'+(on?' on':'')+'" role="checkbox" tabindex="0"'+
+      ' aria-checked="'+(on?'true':'false')+'" data-pin="'+esc(key)+
+      '" title="'+(on?'pinned — click to unpin':'pin to the watching panel')+'">&#128278;</span>';
+  }
+  function tagRank(t){
+    var r=0;
+    if(t.blocked)r+=8;
+    if(/DECISION|Decision:|CONCEPT/.test(t.title))r+=4;
+    if(t.wip)r+=2;
+    if(t.pinned)r+=1;
+    return r;
   }
   function matchQ(t,q){
     var idl=t.id.toLowerCase();
@@ -3235,19 +3591,22 @@ section.collapsed .sec-head{margin-bottom:0}
   function renderTopStrip(){
     var d=STATE.data,strip=document.getElementById("topstrip");
     var pins=d.pinned||[],wip=d.wip||[];
-    function row(it,extra){
+    function row(it,extra,drag){
       /* doc pins link to their /doc/ page and skip the ticket-only badges */
       var href=it.doc?'/doc/'+encodeURI(it.doc):'/ticket/'+encodeURIComponent(it.id);
-      return '<a href="'+href+'"'+(it.doc?'':dataAttrs(it))+'>'+
+      var meta=(it.doc?'':depChip(it)+metaBadges(it,false))+extra;
+      return '<a href="'+href+'"'+(it.doc?'':dataAttrs(it))+
+        (drag?' draggable="true" data-pin-key="'+esc(it.doc||it.id)+'" title="drag to reorder"':'')+'>'+
+        '<span class="b-body"><span class="b-line1">'+
         (it.doc?'<span class="g-kind k-doc">doc</span>':statusChipHtml(it.status))+
         '<span class="b-tid">'+esc(it.id)+'</span>'+
-        '<span class="b-ttl">'+esc(it.title)+'</span>'+
-        '<span class="b-right">'+(it.doc?'':metaBadges(it,true))+extra+'</span></a>';
+        '<span class="b-ttl">'+esc(it.title)+'</span></span>'+
+        (meta?'<span class="b-right">'+meta+'</span>':'')+'</span>'+
+        '<span class="b-rail">'+(it.doc?'':revChip(it))+pinChip(it)+'</span></a>';
     }
     document.getElementById("pinnedList").innerHTML=pins.map(function(it){
-      return row(it,'<button type="button" class="pin-x" data-id="'+esc(it.doc||it.id)+
-        '" title="unpin '+esc(it.id)+'">✕ unpin</button>');
-    }).join("")||'<div class="chart-empty">Nothing pinned — use the 🔖 button at the top of any ticket or doc page.</div>';
+      return row(it,"",true);
+    }).join("")||'<div class="chart-empty">Nothing pinned — use the 🔖 rail button on any row, or the one at the top of any ticket or doc page.</div>';
     var wPanel=document.getElementById("wipPanel");
     var shown=wip.slice(0,8),more=wip.length-shown.length;
     document.getElementById("wipList").innerHTML=shown.map(function(it){
@@ -3593,8 +3952,22 @@ section.collapsed .sec-head{margin-bottom:0}
       b.setAttribute("aria-pressed",String(b.getAttribute("data-mode")===STATE.meterMode));
     });
   }
+  // The quote turns over with the board: Regenerate and every pin / review /
+  // reorder deals a new one. showQuote paints whatever the server handed us.
+  function showQuote(q){
+    var hq=document.getElementById("hQuote");
+    if(!hq||!q)return;
+    hq.innerHTML="“"+esc(q.text)+"”"+
+      (q.by?' <span class="q-by">— '+esc(q.by)+"</span>":"");
+  }
+  function newQuote(){
+    if(!document.getElementById("hQuote"))return;   // quotes switched off
+    fetch("/api/quote",{cache:"no-store"}).then(function(r){return r.json();})
+      .then(function(j){showQuote(j.quote);}).catch(function(){});
+  }
   function renderHeader(d){
     var t=d.totals, resolved=t.total?((t.closed+t.wf)/t.total*100):0;
+    showQuote(d.quote);
     document.getElementById("tagline").innerHTML=
       '__TAGLINE__ <b>'+t.total.toLocaleString()+' tickets</b> across '+d.epics.length+
       ' epics. <b>'+resolved.toFixed(1)+'%</b> resolved; <b>'+t.open+'</b> still open.';
@@ -3704,18 +4077,22 @@ section.collapsed .sec-head{margin-bottom:0}
     var chip=isDec?'<span class="b-dec">decision</span>':
       view==="wf"?'<span class="b-dec">won\'t-fix</span>':
       view==="standing"?'<span class="b-dec">standing</span>':'';
+    var meta=depChip(it)+metaBadges(it,withEpic)+(date?'<span class="b-date">'+date+'</span>':'');
     return '<li><a class="'+(view==="closed"?"closed":"")+'" href="/ticket/'+encodeURIComponent(it.id)+
-      '"'+dataAttrs(it)+'><span class="b-tid">'+esc(it.id)+'</span>'+
-      '<span class="b-ttl">'+name+chip+'</span>'+
-      '<span class="b-right">'+metaBadges(it,withEpic)+
-      (date?'<span class="b-date">'+date+'</span>':'')+'</span></a></li>';
+      '"'+dataAttrs(it)+'><span class="b-body"><span class="b-line1">'+
+      '<span class="b-tid">'+esc(it.id)+'</span>'+
+      '<span class="b-ttl">'+name+chip+'</span></span>'+
+      (meta?'<span class="b-right">'+meta+'</span>':'')+'</span>'+
+      '<span class="b-rail">'+revChip(it)+pinChip(it)+'</span></a></li>';
   }
   function recentRow(it,datefield,tidColor,extra){
+    var meta=depChip(it)+metaBadges(it,false)+extra+'<span class="b-date">'+(it[datefield]||"")+'</span>';
     return '<a href="/ticket/'+encodeURIComponent(it.id)+'"'+dataAttrs(it)+'>'+
+      '<span class="b-body"><span class="b-line1">'+
       '<span class="b-tid"'+(tidColor?' style="color:'+tidColor+'"':'')+'>'+esc(it.id)+'</span>'+
-      '<span class="b-ttl">'+esc(it.title)+'</span>'+
-      '<span class="b-right">'+metaBadges(it,true)+extra+
-      '<span class="b-date">'+(it[datefield]||"")+'</span></span></a>';
+      '<span class="b-ttl">'+esc(it.title)+'</span></span>'+
+      '<span class="b-right">'+meta+'</span></span>'+
+      '<span class="b-rail">'+revChip(it)+pinChip(it)+'</span></a>';
   }
   function renderRecent(){
     var d=STATE.data;
@@ -3817,7 +4194,7 @@ section.collapsed .sec-head{margin-bottom:0}
       host.appendChild(det);
       return;
     }
-    var filtering=!!(STATE.fRisk||STATE.fPrio||STATE.fEff||STATE.fBlk);
+    var filtering=!!(STATE.fRisk||STATE.fPrio||STATE.fEff||STATE.fBlk||STATE.fTag);
     var eps=d.epics.filter(function(e){return (e.open+e.closed)>0;}).slice();
     if(!STATE.showEmpty)eps=eps.filter(function(e){return e.open>0;});
     eps.sort(function(a,b){
@@ -3862,7 +4239,7 @@ section.collapsed .sec-head{margin-bottom:0}
   var HASH_DEFAULTS={q:"",risk:"",prio:"",eff:"",blk:"",tsort:"date",esort:"recentClosed",
     sort:"open",bucket:"week",n:"3",meter:"tickets",empty:"0"};
   function syncHash(){
-    var m={q:STATE.q.trim(),risk:STATE.fRisk,prio:STATE.fPrio,eff:STATE.fEff,blk:STATE.fBlk,
+    var m={q:STATE.q.trim(),risk:STATE.fRisk,prio:STATE.fPrio,eff:STATE.fEff,blk:STATE.fBlk,tag:STATE.fTag,
       tsort:STATE.tSort,esort:STATE.backlogSort,sort:STATE.sort,bucket:STATE.bucket,
       n:String(STATE.recentN),meter:STATE.meterMode,empty:STATE.showEmpty?"1":"0"};
     var parts=[];
@@ -3881,6 +4258,7 @@ section.collapsed .sec-head{margin-bottom:0}
     if(m.prio!=null)STATE.fPrio=m.prio;
     if(m.eff!=null)STATE.fEff=m.eff;
     if(m.blk!=null)STATE.fBlk=m.blk;
+    if(m.tag!=null)STATE.fTag=m.tag;
     if(m.tsort!=null)STATE.tSort=m.tsort;
     if(m.esort!=null)STATE.backlogSort=m.esort;
     if(m.sort!=null)STATE.sort=m.sort;
@@ -3895,6 +4273,7 @@ section.collapsed .sec-head{margin-bottom:0}
     document.getElementById("fPrio").value=STATE.fPrio;
     document.getElementById("fEff").value=STATE.fEff;
     document.getElementById("fBlk").value=STATE.fBlk;
+    document.getElementById("fTag").value=STATE.fTag;
     document.getElementById("tSort").value=STATE.tSort;
     document.getElementById("epicSort").value=STATE.backlogSort;
     document.getElementById("showEmpty").checked=STATE.showEmpty;
@@ -3949,17 +4328,66 @@ section.collapsed .sec-head{margin-bottom:0}
     if(!ch)return;ev.preventDefault();
     location.href="/deps?id="+encodeURIComponent(ch.getAttribute("data-dep"));
   });
-  // Unpin controls (panel buttons + pinned chips) sit inside ticket links too.
+  // The rail's pin toggle sits inside ticket links; flip it via the API and
+  // refresh the board so the pinned panel agrees.
   document.addEventListener("click",function(ev){
-    var b=ev.target.closest(".pin-x[data-id],.b-meta.pinned[data-unpin]");if(!b)return;
+    var b=ev.target.closest(".b-meta.pinchip[data-pin]");if(!b)return;
     ev.preventDefault();ev.stopPropagation();
-    if(b.disabled)return;
-    b.disabled=true;
+    if(b.getAttribute("data-busy"))return;
+    b.setAttribute("data-busy","1");
     fetch("/api/pin",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({id:b.getAttribute("data-id")||b.getAttribute("data-unpin"),
-        pinned:false})})
+      body:JSON.stringify({id:b.getAttribute("data-pin"),
+        pinned:b.getAttribute("aria-checked")!=="true"})})
       .then(function(){load();});
   },true);
+  document.addEventListener("keydown",function(ev){
+    if(ev.key!=="Enter"&&ev.key!==" ")return;
+    var ch=ev.target&&ev.target.closest?ev.target.closest(".b-meta.pinchip[data-pin]"):null;
+    if(!ch)return;ev.preventDefault();ch.click();
+  });
+  // Drag a pinned row to a new spot; the order is stamped server-side, so it
+  // survives reloads. Delegated to the panel, which outlives its re-renders.
+  (function(){
+    var list=document.getElementById("pinnedList"),dragging=null,dragEnd=0;
+    list.addEventListener("dragstart",function(e){
+      var a=e.target.closest("a[data-pin-key]");if(!a)return;
+      dragging=a;a.classList.add("pin-drag");
+      e.dataTransfer.effectAllowed="move";
+      try{e.dataTransfer.setData("text/plain",a.getAttribute("data-pin-key"));}catch(err){}
+    });
+    list.addEventListener("dragover",function(e){
+      if(!dragging)return;e.preventDefault();e.dataTransfer.dropEffect="move";
+      var a=e.target.closest("a[data-pin-key]");if(!a||a===dragging)return;
+      var r=a.getBoundingClientRect();
+      a.parentNode.insertBefore(dragging,(e.clientY-r.top)<r.height/2?a:a.nextSibling);
+    });
+    list.addEventListener("drop",function(e){e.preventDefault();});
+    list.addEventListener("dragend",function(){
+      if(!dragging)return;
+      dragging.classList.remove("pin-drag");dragging=null;dragEnd=Date.now();
+      var keys=Array.prototype.map.call(list.querySelectorAll("a[data-pin-key]"),
+        function(a){return a.getAttribute("data-pin-key");});
+      fetch("/api/pin-order",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({ids:keys})}).then(function(){load();});
+    });
+    // a drag that ends on the row must not read as a click on the link
+    list.addEventListener("click",function(e){
+      if(Date.now()-dragEnd<400){e.preventDefault();e.stopPropagation();}},true);
+  })();
+  // The review tick flips in place (no reload); keep the board model it
+  // renders from in step so tag filters and re-renders agree with the chips.
+  // The quote still turns over — every ticket interaction deals a new one.
+  document.addEventListener("ifc-review",function(ev){
+    var id=ev.detail.id,on=ev.detail.reviewed,d=STATE.data;
+    newQuote();
+    if(!d)return;
+    function patch(t){if(t&&t.id===id)t.reviewed=on;}
+    (d.epics||[]).forEach(function(e){
+      ["openTickets","closedTickets","wfTickets","standingTickets"].forEach(function(k){
+        (e[k]||[]).forEach(patch);});});
+    ["pinned","wip","recentClosed","recentCreated"].forEach(function(k){
+      (d[k]||[]).forEach(patch);});
+  });
   document.addEventListener("keydown",function(ev){
     if(ev.key!=="Enter")return;
     var ch=ev.target.closest?ev.target.closest(".b-meta[data-epic]"):null;if(!ch)return;
@@ -3978,7 +4406,7 @@ section.collapsed .sec-head{margin-bottom:0}
   document.getElementById("regen").addEventListener("click",load);
   var es=document.getElementById("epicSort");
   if(es) es.addEventListener("change",function(){STATE.backlogSort=es.value;renderBacklog();syncHash();});
-  [["fRisk","fRisk"],["fPrio","fPrio"],["fEff","fEff"],["fBlk","fBlk"],["tSort","tSort"]].forEach(function(pair){
+  [["fRisk","fRisk"],["fPrio","fPrio"],["fEff","fEff"],["fBlk","fBlk"],["fTag","fTag"],["tSort","tSort"]].forEach(function(pair){
     var el=document.getElementById(pair[0]);
     el.addEventListener("change",function(){STATE[pair[1]]=el.value;renderBacklog();syncHash();});
   });
@@ -5815,10 +6243,37 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/data":
             try:
                 data, _ = scan()
+                # Regenerate re-renders from this payload without reloading the
+                # page, so the quote rides along and turns over with the board.
+                data["quote"] = pick_quote()
                 self._send(json.dumps(data), "application/json; charset=utf-8")
             except Exception as exc:  # surface scan errors to the button
                 self._send(json.dumps({"error": str(exc)}),
                            "application/json; charset=utf-8", code=500)
+            return
+        if path in ("/api/events", "/api/events/"):
+            # The automation surface: counts (hub-wide + per interface) and the
+            # events after a cursor. `?since=<seq>` is how a poller catches up;
+            # `?interface=<slug>` narrows the counts to one project.
+            import urllib.parse          # a later branch rebinds the name
+            qs = urllib.parse.parse_qs(
+                self.path.split("?", 1)[1] if "?" in self.path else "")
+            since = (qs.get("since") or ["0"])[0]
+            iface = (qs.get("interface") or [""])[0]
+            log = events.load()
+            body = {"seq": log["seq"],
+                    "counts": log["counts"],
+                    "interfaces": log["interfaces"],
+                    "events": events.since(since if since.isdigit() else 0)}
+            if iface:
+                body["counts"] = log["interfaces"].get(iface, {})
+                body["events"] = [e for e in body["events"]
+                                  if e.get("interface") == iface]
+            self._send(json.dumps(body), "application/json; charset=utf-8")
+            return
+        if path == "/api/quote":
+            self._send(json.dumps({"quote": pick_quote()}),
+                       "application/json; charset=utf-8")
             return
         if path == "/api/note":
             import urllib.parse
@@ -6011,7 +6466,64 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(json.dumps({"ok": False, "error": str(exc)}),
                            "application/json; charset=utf-8", code=500)
                 return
+            _record("pin" if want else "unpin", tid)
             self._send(json.dumps({"ok": True, "id": tid, "pinned": want}),
+                       "application/json; charset=utf-8")
+            return
+        if self.path == "/api/review":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                tid = payload["id"]
+                want = bool(payload.get("reviewed"))
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": "bad request: " + str(exc)}),
+                           "application/json; charset=utf-8", code=400)
+                return
+            _, id_index = scan()
+            if tid not in id_index:
+                self._send(json.dumps({"ok": False, "error": "unknown ticket " + tid}),
+                           "application/json; charset=utf-8", code=404)
+                return
+            try:
+                # the tick edits the ticket itself: `## Reviewed ✅` in the body
+                set_reviewed(id_index[tid], want)
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": str(exc)}),
+                           "application/json; charset=utf-8", code=500)
+                return
+            _record("review" if want else "unreview", tid)
+            self._send(json.dumps({"ok": True, "id": tid, "reviewed": want}),
+                       "application/json; charset=utf-8")
+            return
+        if self.path == "/api/pin-order":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                ids = payload["ids"]
+                if (not isinstance(ids, list)
+                        or not all(isinstance(i, str) for i in ids)):
+                    raise ValueError("ids must be a list of pin keys")
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": "bad request: " + str(exc)}),
+                           "application/json; charset=utf-8", code=400)
+                return
+            try:
+                pins = load_pins()
+                # Re-stamp the named pins to encode the order (the panel shows
+                # newest first); unknown keys are ignored, not invented.
+                base = datetime.datetime.now()
+                known = [i for i in ids if i in pins]
+                for n, key in enumerate(known):
+                    pins[key] = (base - datetime.timedelta(seconds=n)
+                                 ).isoformat(timespec="seconds")
+                save_pins(pins)
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": str(exc)}),
+                           "application/json; charset=utf-8", code=500)
+                return
+            _record("reorder", None, n=len(known))
+            self._send(json.dumps({"ok": True, "order": known}),
                        "application/json; charset=utf-8")
             return
         if self.path == "/api/note":
@@ -6060,6 +6572,28 @@ class Handler(BaseHTTPRequestHandler):
                            "application/json; charset=utf-8", code=500)
                 return
             self._send(json.dumps({"ok": True, "html": rendered}),
+                       "application/json; charset=utf-8")
+            return
+        if self.path == "/api/settings":
+            # The footer ⚙ panel: flip one feature flag in config.json.
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                key = payload["key"]
+                if key not in {k for k, _l, _n, _v in feature_toggles()}:
+                    raise ValueError("unknown setting %r" % key)
+                value = bool(payload.get("value"))
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": "bad request: " + str(exc)}),
+                           "application/json; charset=utf-8", code=400)
+                return
+            try:
+                save_setting(key, value)
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": str(exc)}),
+                           "application/json; charset=utf-8", code=500)
+                return
+            self._send(json.dumps({"ok": True, "key": key, "value": value}),
                        "application/json; charset=utf-8")
             return
         if self.path == "/api/theme":
@@ -6175,14 +6709,14 @@ THEMES = {
             "#e9edf1": "#ece7f2", "#f3f6f9": "#f5f2f9", "#101720": "#14101f",
             "#3a4652": "#423a52", "#5d6a77": "#675d77", "#d6dde5": "#dcd5e6",
             "#1c3bb3": "#06718a", "#2f9e5b": "#2b9e33", "#8a94a0": "#948aa0",
-            "#b3781a": "#bd5410", "#0b0f15": "#100b1a", "#141b25": "#1a1428",
-            "#0f1620": "#150f22", "#e8edf3": "#ece8f3", "#c2ccd6": "#cac2d6",
-            "#8b98a6": "#948ba6", "#26313e": "#322640", "#a9bdff": "#8ff0fb",
-            "#48c483": "#46d332", "#69747f": "#71697f", "#d9a441": "#ff8a4d",
+            "#b3781a": "#bd5410", "#090e16": "#100b1a", "#151e2d": "#1a1428",
+            "#101724": "#150f22", "#edf2f9": "#ece8f3", "#c6d2e0": "#cac2d6",
+            "#8fa0b5": "#948ba6", "#2a3a4d": "#322640", "#a9bdff": "#8ff0fb",
+            "#48c483": "#46d332", "#75828f": "#71697f", "#d9a441": "#ff8a4d",
             "#e6ebf0": "#e9e4f0", "#2b53e6": "#0894b3", "#dbe2fb": "#d6f4f9",
             "#d3ecdc": "#daf5d4", "#98a2ad": "#9d98ad", "#e2e6ea": "#e6e2ea",
-            "#1d2732": "#291d36", "#6a8dff": "#2ee6f7", "#1c2740": "#0b3540",
-            "#16311f": "#143310", "#222c37": "#2c2237", "#3987e5": "#29c8de",
+            "#202c3c": "#291d36", "#6a8dff": "#2ee6f7", "#1d2b4d": "#0b3540",
+            "#143423": "#143310", "#243141": "#2c2237", "#3987e5": "#29c8de",
             "#199e70": "#23b53c", "#86b6ef": "#efe08e", "#5598e7": "#f7ae5e",
             "#2a78d6": "#f0742c", "#1c5cab": "#b8107f", "#184f95": "#45400f",
             "#256abf": "#6d3d12", "#c23b3b": "#d6219c", "#e06c6c": "#e668c2",
@@ -6239,7 +6773,7 @@ def _palette_css(light, dark, strip):
         return ":root{%s}" % ";".join("%s:%s" % kv for kv in pairs)
 
     css = block(light, light.get("surface", "#ffffff"))
-    css += "@media(prefers-color-scheme:dark){%s}" % block(dark, dark.get("surface", "#141b25"))
+    css += "@media(prefers-color-scheme:dark){%s}" % block(dark, dark.get("surface", "#151e2d"))
     css += (".b-open{background:var(--accent-soft);color:var(--accent-ink)}"
             ".b-closed{background:var(--done-soft);color:var(--done)}"
             ".b-wf{background:var(--wf-soft);color:var(--wf)}")
@@ -6317,11 +6851,10 @@ def _theme_swatch_colors(name):
     return p["ground"], p["accent"]
 
 
-def save_theme(name):
-    """Write the chosen preset into the active repo's config.json (preserving
-    every other key) and re-resolve the live theme, so the very next render —
-    the reload the picker triggers — already wears it."""
-    global THEME_REMAP, THEME_STRIP, THEME_OVERRIDE_CSS, THEME_NAME
+def _config_set(key, value):
+    """Read-modify-write one key in the active repo's config.json (preserving
+    every other key), keeping the interface cache in step so the next request
+    doesn't re-read a stale file. Returns the full config."""
     path = os.path.join(REPO_ROOT, CONFIG_REL)
     try:
         with open(path, encoding="utf-8") as fh:
@@ -6330,19 +6863,79 @@ def save_theme(name):
             conf = {}
     except FileNotFoundError:
         conf = {}
-    conf["theme"] = name
+    conf[key] = value
     _ensure_state_dir()
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(conf, fh, indent=2, ensure_ascii=False)
         fh.write("\n")
     os.replace(tmp, path)
-    THEME_REMAP, THEME_STRIP, THEME_OVERRIDE_CSS = resolve_theme(name)
-    THEME_NAME = name
     it = _IFACE_BY_SLUG.get(ACTIVE_SLUG)
     if it is not None:
-        it.conf["theme"] = name
+        it.conf[key] = value
         it._mtime = it._conf_mtime()
+    return conf
+
+
+def save_theme(name):
+    """Write the chosen preset into the active repo's config.json and
+    re-resolve the live theme, so the very next render — the reload the
+    picker triggers — already wears it."""
+    global THEME_REMAP, THEME_STRIP, THEME_OVERRIDE_CSS, THEME_NAME
+    _config_set("theme", name)
+    THEME_REMAP, THEME_STRIP, THEME_OVERRIDE_CSS = resolve_theme(name)
+    THEME_NAME = name
+
+
+# The footer settings panel: one row per toggleable feature, persisted as a
+# top-level config.json key — the same key you'd edit by hand. A future
+# feature earns a checkbox by adding (key, label, note, live-value) here.
+def feature_toggles():
+    return [
+        ("quotes", "Header quote",
+         "a rotating quote beside the project name", QUOTES_ON),
+    ]
+
+
+def save_setting(key, value):
+    """Persist one feature flag and apply it live, so the reload the panel
+    triggers already renders it."""
+    apply_config(_config_set(key, value))
+
+
+def render_settings_panel():
+    """The footer's ⚙ settings: a quiet drop-up of feature checkboxes across
+    from the launch/stop commands. Spans only — it rides inside a <p>."""
+    rows = ""
+    for key, label, note, on in feature_toggles():
+        rows += ('<label class="sp-row"><input type="checkbox" data-setting="%s"%s>'
+                 '<span class="sp-txt"><span class="sp-lab">%s</span>'
+                 '<span class="sp-note">%s</span></span></label>'
+                 % (html.escape(key, quote=True), " checked" if on else "",
+                    html.escape(label), html.escape(note)))
+    return (
+        "<span class='fc-set'>"
+        "<button type='button' id='setBtn' aria-expanded='false'"
+        " title='Dashboard settings'>&#9881; settings</button>"
+        "<span class='setpanel' id='setPanel' hidden>"
+        "<span class='sp-h'>Features</span>" + rows + "</span></span>"
+        "<script>(function(){"
+        "var b=document.getElementById('setBtn'),p=document.getElementById('setPanel');"
+        "b.addEventListener('click',function(e){e.stopPropagation();"
+        "p.hidden=!p.hidden;b.setAttribute('aria-expanded',String(!p.hidden));});"
+        "document.addEventListener('click',function(e){"
+        "if(!p.hidden&&!p.contains(e.target)&&e.target!==b){p.hidden=true;"
+        "b.setAttribute('aria-expanded','false');}});"
+        "document.addEventListener('keydown',function(e){if(e.key==='Escape')p.hidden=true;});"
+        "p.addEventListener('change',function(e){"
+        "var c=e.target.closest('input[data-setting]');if(!c)return;"
+        "c.disabled=true;"
+        "fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({key:c.getAttribute('data-setting'),value:c.checked})})"
+        ".then(function(r){return r.json();})"
+        ".then(function(res){if(!res||!res.ok)throw 0;location.reload();})"
+        ".catch(function(){c.disabled=false;c.checked=!c.checked;});"
+        "});})();</script>")
 
 
 def render_theme_picker():
@@ -6564,9 +7157,15 @@ _LIST_TOOLS = r"""<style>
 .list-tools button{font-family:var(--font-mono,ui-monospace,monospace);font-size:.66rem;letter-spacing:.04em;
 color:var(--accent-ink,var(--accent,#0a7d6b));background:none;border:0;cursor:pointer;padding:0;white-space:nowrap}
 .list-tools button:hover{text-decoration:underline}
+.list-tools .lt-sort{font-family:var(--font-mono,ui-monospace,monospace);font-size:.66rem;letter-spacing:.04em;
+color:var(--accent-ink,var(--accent,#0a7d6b));background:none;border:0;cursor:pointer;padding:0}
 </style><script>(function(){
 function rowsOf(sel){var c=sel&&document.querySelector(sel);if(!c)return [];
-  return Array.prototype.map.call(c.querySelectorAll('a[href*="/ticket/"]'),function(a){
+  /* only rows the reader can see: a filtered list copies (pins, exports) the
+     filtered set, not the page load */
+  return Array.prototype.filter.call(c.querySelectorAll('a[href*="/ticket/"]'),function(a){
+    var li=a.closest("li");return !(li&&li.hidden);
+  }).map(function(a){
     var d=a.dataset||{},h=a.getAttribute("href")||"",id=decodeURIComponent((h.split("/ticket/")[1]||"").split(/[?#]/)[0]);
     return {id:id,slug:d.slug||id,title:d.title||"",status:d.status||"",epic:d.epic||"",
             priority:d.priority||"",risk:d.risk||"",effort:d.effort||""};});}
@@ -6587,18 +7186,118 @@ document.addEventListener("click",function(e){
   var one=e.target.closest(".copy-one[data-copy]");
   if(one){e.preventDefault();copy(one.getAttribute("data-copy"),one,"copied");return;}
   var b=e.target.closest(".list-tools button");if(!b)return;
-  var box=b.closest(".list-tools"),items=rowsOf(box.getAttribute("data-src"));
+  var box=b.closest(".list-tools");
+  if(b.classList.contains("lt-unpin")){
+    /* the pinned panel's counterpart to pin-all. data-pin-key covers doc pins,
+       which rowsOf (ticket links only) would miss. */
+    var host=document.querySelector(box.getAttribute("data-src")),keys=[];
+    if(host)keys=Array.prototype.map.call(host.querySelectorAll("a[data-pin-key]"),
+      function(a){return a.getAttribute("data-pin-key");});
+    if(!keys.length)keys=rowsOf(box.getAttribute("data-src")).map(function(t){return t.id;});
+    if(!keys.length){flash(b,"no items");return;}
+    b.disabled=true;
+    Promise.all(keys.map(function(k){
+      return fetch("/api/pin",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({id:k,pinned:false})});}))
+      .then(function(){location.reload();})
+      .catch(function(){b.disabled=false;flash(b,"unpin failed");});
+    return;
+  }
+  var items=rowsOf(box.getAttribute("data-src"));
   if(!items.length){flash(b,"no items");return;}
   if(b.classList.contains("lt-copy"))copy(items.map(function(t){return t.slug||t.id;}).join("\n"),b,"copied "+items.length);
+  else if(b.classList.contains("lt-pin")){
+    /* pin the lot; the reload shows the chips agreeing with the server */
+    b.disabled=true;
+    Promise.all(items.map(function(t){
+      return fetch("/api/pin",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({id:t.id,pinned:true})});}))
+      .then(function(){location.reload();})
+      .catch(function(){b.disabled=false;flash(b,"pin failed");});
+  }
   else csv(items,box.getAttribute("data-name")||"tickets");
 });
+/* view-only sort on lists that opt in (data-sort): reorders the rendered rows
+   from their data- attributes, never the data behind them. Rows without a key
+   (doc pins, "+N more") sink to the bottom; "sort" restores the served order.
+   A re-render rebuilds the list in served order, so the observer re-applies
+   the picked sort and the select never lies about what's shown. */
+var SORT_KEY={
+  status:function(d){var s=(d.status||"").toUpperCase();
+    return s==="OPEN"?0:s==="CLOSED"?1:s?2:9;},
+  priority:function(d){return d.priority?parseInt(d.priority,10):9e9;},
+  risk:function(d){var r={HIGH:0,MEDIUM:1,LOW:2},k=(d.risk||"").toUpperCase();return k in r?r[k]:9;},
+  effort:function(d){var m=/^\s*([\d.]+)\s*([hdw]?)/i.exec(d.effort||"");
+    return m?parseFloat(m[1])*({h:1,d:8,w:40}[(m[2]||"h").toLowerCase()]||1):9e9;},
+  id:function(d){return d.slug||"\uffff";}};
+function sortRows(box,sel){
+  var host=document.querySelector(box.getAttribute("data-src"));if(!host)return;
+  var rows=Array.prototype.filter.call(host.children,function(el){
+    return el.tagName==="A"||el.tagName==="LI";});
+  if(rows.length<2)return;
+  rows.forEach(function(el,i){if(el._ifcIdx==null)el._ifcIdx=i;});
+  var key=SORT_KEY[sel.value];
+  rows.sort(function(a,b){
+    if(!key)return a._ifcIdx-b._ifcIdx;
+    var ka=key(a.dataset||{}),kb=key(b.dataset||{});
+    return ka<kb?-1:ka>kb?1:a._ifcIdx-b._ifcIdx;});
+  host._ifcSorting=true;
+  rows.forEach(function(el){host.appendChild(el);});
+}
+Array.prototype.forEach.call(document.querySelectorAll(".list-tools[data-sort]"),function(box){
+  var host=document.querySelector(box.getAttribute("data-src"));if(!host)return;
+  var sel=document.createElement("select");
+  sel.className="lt-sort";sel.title="Sort this list (display only)";
+  [["default","sort"],["status","status"],["priority","priority"],["risk","risk"],["effort","effort"],["id","id"]]
+    .forEach(function(o){var op=document.createElement("option");
+      op.value=o[0];op.textContent=o[1];sel.appendChild(op);});
+  box.insertBefore(sel,box.firstChild);
+  sel.addEventListener("change",function(){sortRows(box,sel);});
+  if(window.MutationObserver)new MutationObserver(function(){
+    if(host._ifcSorting){host._ifcSorting=false;return;}
+    if(sel.value!=="default")sortRows(box,sel);
+  }).observe(host,{childList:true});
+});
+/* the review tick lives on grids, dashboards AND ticket pages; this script is
+   on all of them, so the one binding is here. POST, then flip every chip for
+   that ticket in place — no reload, no jank. Rows keep their data-reviewed in
+   step for the tag filters, and an ifc-review event lets the dashboard patch
+   the board model it renders from. */
+function revFromEvent(ev){
+  var ch=ev.target.closest&&ev.target.closest(".revchip[data-review]");
+  if(!ch)return;
+  ev.preventDefault();ev.stopPropagation();
+  var id=ch.getAttribute("data-review"),want=ch.getAttribute("aria-checked")!=="true";
+  ch.style.pointerEvents="none";
+  fetch("/api/review",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({id:id,reviewed:want})})
+    .then(function(r){return r.json();})
+    .then(function(res){
+      if(!res||!res.ok)throw 0;
+      Array.prototype.forEach.call(
+        document.querySelectorAll('.revchip[data-review="'+id+'"]'),function(c){
+          c.classList.toggle("on",want);
+          c.setAttribute("aria-checked",want?"true":"false");
+          var li=c.closest("li[data-id]");
+          if(li)li.setAttribute("data-reviewed",want?"y":"n");
+        });
+      document.dispatchEvent(new CustomEvent("ifc-review",{detail:{id:id,reviewed:want}}));
+    })
+    .catch(function(){ch.title="review toggle failed — server down?";})
+    .then(function(){ch.style.pointerEvents="";});
+}
+document.addEventListener("click",revFromEvent,true);
+document.addEventListener("keydown",function(ev){
+  if(ev.key==="Enter"||ev.key===" ")revFromEvent(ev);},true);
 })();</script>"""
 
 
 def _list_tools(src, name):
-    """A tiny copy-ids + CSV toolbar bound (by CSS selector) to a ticket list."""
+    """A tiny copy-ids + pin-all + CSV toolbar bound (by CSS selector) to a
+    ticket list — one action across every ticket the list shows."""
     return ("<span class='list-tools' data-src='%s' data-name='%s'>"
             "<button type='button' class='lt-copy'>copy ids</button>"
+            "<button type='button' class='lt-pin' title='Pin every ticket in this list'>pin all</button>"
             "<button type='button' class='lt-csv'>CSV</button></span>"
             % (html.escape(src, quote=True), html.escape(name, quote=True)))
 
@@ -6629,6 +7328,10 @@ def _transform_html(s):
     # the standard title mark renders even with no config file.
     if "__HDR_ICON__" in s:
         s = s.replace("__HDR_ICON__", html.escape(HEADER_ICON))
+    if "__QUOTE__" in s:
+        s = s.replace("__QUOTE__", quote_html())
+    if "__SETTINGS__" in s:
+        s = s.replace("__SETTINGS__", render_settings_panel())
     if "__PROJECT_LINKS__" in s:
         s = s.replace("__PROJECT_LINKS__", _LINK_ADD_BTN + render_project_links())
     if "__DOC_SERIES__" in s:
@@ -6660,8 +7363,9 @@ def _transform_html(s):
     # popover — the small emoji/title/url editor that writes config.json.
     if "link-add" in s and "</body>" in s:
         s = s.replace("</body>", _linkedit_html() + "</body>", 1)
-    # Wire copy-ids + CSV toolbars (ticket lists) and single-item copy buttons.
-    if ("list-tools" in s or "copy-one" in s) and "</body>" in s:
+    # Wire copy-ids + pin-all + CSV toolbars (ticket lists), single-item copy
+    # buttons, and the review tick.
+    if ("list-tools" in s or "copy-one" in s or "revchip" in s) and "</body>" in s:
         s = s.replace("</body>", _LIST_TOOLS + "</body>", 1)
     # Every fenced code block gets a hover "copy" button, on any page.
     if "<pre" in s and "</body>" in s:
@@ -6692,7 +7396,7 @@ def apply_config(conf):
     """Overwrite the live per-interface globals from a parsed config dict.
     Missing keys keep the current (default) value, so partial configs are fine."""
     global PFX, ID_DIGITS, BRAND, FAVICON, HEADER_ICON, EYEBROW, TAGLINE
-    global SERVER_PORT, EPIC_TITLES, EPIC_EMOJI, THEME_REMAP, THEME_STRIP, _IDRE
+    global SERVER_PORT, EPIC_TITLES, EPIC_EMOJI, THEME_REMAP, THEME_STRIP, _IDRE, QUOTES_ON
     global THEME_OVERRIDE_CSS, LINKS, DOC_RULES
     global TICKET_ID_RE, EPIC_CODE_RE, TICKET_PARTS_RE, DEP_ID_RE, SUB_ID_RE
     global TICKET_LINK_RE, EPIC_LINK_RE, _MD_EPIC_FILE_RE, _MD_TICKET_FILE_RE
@@ -6703,6 +7407,7 @@ def apply_config(conf):
     HEADER_ICON = brand.get("icon", brand.get("favicon", _DEF["icon"]))
     EYEBROW = brand.get("eyebrow", _DEF["eyebrow"])
     TAGLINE = brand.get("tagline", _DEF["tagline"])
+    QUOTES_ON = bool(conf.get("quotes", True))
 
     links = conf.get("links", [])
     LINKS = links if isinstance(links, (list, dict)) else []
@@ -7004,8 +7709,8 @@ body{padding-top:52px}
 padding:8px 18px;background:var(--surface,#fff);border-bottom:1px solid var(--line,#e2e2e2);
 box-shadow:0 1px 3px rgba(0,0,0,.06)}
 #ifc-actions{margin-left:auto;display:flex;align-items:center;gap:8px}
-/* the pocket + GitHub sit dead-centre in the bar, independent of the left/right
-   slots — the same pair, in the same place, on every page */
+/* the pocket sits dead-centre in the bar, independent of the left/right
+   slots — the same badge, in the same place, on every page */
 #ifc-center{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;align-items:center;gap:8px}
 #ifc-center:empty{display:none}
 /* 32px is the bar's one control height. Everything in the bar — GitHub, the
@@ -7075,7 +7780,8 @@ border:1px solid var(--accent,#88a);border-radius:9px;padding:8px 13px;
 transition:background .12s,color .12s}
 #ifc-home:hover{background:var(--accent,#88a);color:var(--surface,#fff)}
 /* persistent controls carried onto every page: notes/to-do, github, links */
-#ifc-center,#ifc-actions{display:flex;align-items:center;gap:8px}
+#ifc-left,#ifc-center,#ifc-actions{display:flex;align-items:center;gap:8px}
+#ifc-left:empty{display:none}
 #ifc-bar .note-btns{display:inline-flex;gap:8px}
 #ifc-bar .notebtn{position:relative;font-size:1rem;border:1px solid var(--line);border-radius:100px;
 width:38px;height:32px;cursor:pointer;line-height:1;padding:0;display:inline-flex;align-items:center;justify-content:center}
@@ -7213,10 +7919,11 @@ if(slug){e.preventDefault();go(slug);}
 /* click-outside-to-close now lives in the notes module itself, so it can honour
    the "keep open" eye. */
 function relocate(){
-/* multi-interface: GitHub info goes to the centre of the sticky switcher bar;
-   project links + notes/to-do go to the right slot (links kept left of the
-   pin/scratchpad). Regenerate deliberately stays in the card header, top row,
-   across from the eyebrow — so it and the icons read as swapped. */
+/* multi-interface: the created/closed pocket goes to the centre of the sticky
+   switcher bar; GitHub slots in beside the project picker; project links +
+   notes/to-do go to the right slot (links kept left of the pin/scratchpad).
+   Regenerate deliberately stays in the card header, top row, across from the
+   eyebrow — so it and the icons read as swapped. */
 var acts=document.getElementById('ifc-actions');
 if(!acts)return;
 var mid=document.getElementById('ifc-center');
@@ -7229,8 +7936,9 @@ function place(el,slot,first){
   if(first&&slot.firstChild)slot.insertBefore(el,slot.firstChild);
   else slot.appendChild(el);
 }
-place(document.getElementById('ghBtn'),mid);                 /* centre */
-place(document.getElementById('todayPocket'),acts,true);     /* right, leading */
+place(document.getElementById('todayPocket'),mid);            /* centre */
+place(document.getElementById('ghBtn'),
+      document.getElementById('ifc-left'));                   /* by the picker */
 place(document.getElementById('projLinks'),acts);
 place(document.querySelector('.note-btns'),acts);
 }
@@ -7442,9 +8150,9 @@ def _gh_link_html():
 
 
 def _persist_controls_html():
-    """(centre, right) markup for the bar on non-dashboard pages: the pocket and
-    GitHub centred, then project links + the notes/to-do buttons on the right —
-    so the whole set follows you from page to page."""
+    """(left, centre, right) markup for the bar on non-dashboard pages: GitHub
+    beside the project picker, the pocket centred, then project links + the
+    notes/to-do buttons on the right — the whole set follows you page to page."""
     notes = ("<span class='note-btns'>"
              "<button class='notebtn nb-notes' type='button' data-which='scratch' aria-label='Open scratchpad'>"
              "<span class='pl-emo'>&#128221;</span><span class='pl-tip' role='tooltip'>Scratchpad</span></button>"
@@ -7452,9 +8160,9 @@ def _persist_controls_html():
              "<span class='pl-emo'>&#128204;</span><span class='pl-tip' role='tooltip'>To-do list</span></button>"
              "</span>")
     links = "<span class='proj-links'>" + _LINK_ADD_BTN + render_project_links() + "</span>"
-    # The pocket is a pair of links into ticket lists — it belongs with the
-    # ticket controls on the right, not with GitHub. GitHub keeps the centre.
-    return _gh_link_html(), pocket_html() + links + notes
+    # The pocket keeps the centre — the board's pulse, same spot on every
+    # page; GitHub rides beside the picker, where a repo-level link belongs.
+    return _gh_link_html(), pocket_html(), links + notes
 
 
 def _switcher_html(is_dash=True):
@@ -7496,9 +8204,9 @@ def _switcher_html(is_dash=True):
             if REGISTRY_FILE else "")
     # On the dashboard these stay empty (its own controls relocate here via JS);
     # on every other page we render github + links + notes so they follow you.
-    center, actions = ("", "")
+    left, center, actions = ("", "", "")
     if not is_dash:
-        center, actions = _persist_controls_html()
+        left, center, actions = _persist_controls_html()
     return (
         "<div id='ifc-bar'><div id='ifc-switch'>"
         "<button id='ifc-cur' type='button' aria-haspopup='listbox' aria-expanded='false'>"
@@ -7508,7 +8216,7 @@ def _switcher_html(is_dash=True):
         "<li class='ifc-hd' aria-hidden='true' style='cursor:default'>Switch interface"
         + hint + "</li>"
         + "".join(rows) + "</ul>"
-        "</div>" + home
+        "</div><span id='ifc-left'>" + left + "</span>" + home
         + "<div id='ifc-center'>" + center + "</div>"
         + "<div id='ifc-actions'>" + actions + "</div></div>"
         "<style>" + _SWITCHER_CSS + "</style><script>" + _SWITCHER_JS
@@ -7560,7 +8268,39 @@ def run(repo_roots, port=None, host="127.0.0.1", open_browser=True,
     else:
         url = "http://%s:%d/" % (host, p)
         plain = None
-    srv = ThreadingHTTPServer((host, p), Handler)
+    # Don't start a second server for a repo that already has one — that is how
+    # you end up with a dozen you didn't know about. Open the one that's there.
+    # (An explicit --port means you asked for a second one; you get it.)
+    roots = [it.root for it in INTERFACES]
+    if port is None:
+        for rec in procs.servers():
+            if sorted(rec.get("roots", [])) == sorted(roots):
+                # Say what is happening, not just what isn't: this exits without
+                # serving, and a terminal that returns to the prompt with no
+                # explanation reads as "it didn't launch".
+                print("already serving  ->  %s  (pid %s)" % (rec["url"], rec["pid"]),
+                      flush=True)
+                print("%s  ·  interfacile stop  to end it, or --port for a second one"
+                      % ("opening it in your browser" if open_browser
+                         else "not starting a second server"), flush=True)
+                if open_browser:
+                    webbrowser.open(rec["url"])
+                return
+
+    try:
+        srv = ThreadingHTTPServer((host, p), Handler)
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        # A socket traceback tells you nothing you can act on. Say what is wrong,
+        # who to ask about it, and hand over a port that works.
+        held = [r for r in procs.servers() if r.get("port") == p]
+        who = ("interfacile is already there (pid %s) — `interfacile ps`"
+               % held[0]["pid"]) if held else "something else is using it"
+        sys.exit("port %d is in use: %s.\n"
+                 "  try:  interfacile %s--port %d"
+                 % (p, who, "hub " if len(INTERFACES) > 1 else "", _free_port(p)))
+
     if len(INTERFACES) > 1:
         print("interfacile hub  ->  %s" % url, flush=True)
         for it in INTERFACES:
@@ -7570,14 +8310,37 @@ def run(repo_roots, port=None, host="127.0.0.1", open_browser=True,
         print("scanning: " + TICKETS_DIR, flush=True)
     if plain:
         print("     also:  %s" % plain, flush=True)
-    print("Ctrl-C to stop.", flush=True)
+    print("Ctrl-C to stop.  ·  interfacile ps / stop", flush=True)
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+
+    # On the record for as long as it runs, and off it however it ends: normal
+    # exit, Ctrl-C, or the SIGTERM that `interfacile stop` sends. atexit is the
+    # backstop — a record that outlives its process is the thing we're here to
+    # prevent (a stale one is swept on the next read, but let's not make one).
+    procs.register(p, url, roots)
+    atexit.register(procs.unregister)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
         srv.shutdown()
+    finally:
+        procs.unregister()
+
+
+def _free_port(start, tries=20):
+    """The next port nothing is listening on, so the advice we print works."""
+    import socket
+    for p in range(start + 1, start + 1 + tries):
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", p))
+            except OSError:
+                continue
+            return p
+    return start + 1
 
 
 def main(argv=None):
