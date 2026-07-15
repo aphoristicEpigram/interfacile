@@ -111,5 +111,30 @@ class EventsCase(unittest.TestCase):
         self.assertEqual(events.counts(), {"close": 1})   # and recovers
 
 
+class InterfaceNameCase(unittest.TestCase):
+    """The CLI and the server must name an interface the same way, or one
+    project's events end up split across two keys and every per-interface
+    count under-reports."""
+
+    def test_slug_is_url_safe_and_stable(self):
+        from interfacile import server
+        self.assertEqual(server.iface_slug("/x/clean_paste_lite"), "clean-paste-lite")
+        self.assertEqual(server.iface_slug("/x/My Project"), "my-project")
+        self.assertEqual(server.iface_slug("/x/interfacile/"), "interfacile")
+        self.assertEqual(server.iface_slug("/x/___"), "iface")
+
+    def test_cli_and_server_agree_on_a_name_with_an_underscore(self):
+        """The regression: `clean_paste_lite` logged as itself from the terminal
+        and as `clean-paste-lite` from the dashboard."""
+        from interfacile import server
+        from interfacile import ticket
+        root = "/tmp/whatever/clean_paste_lite"
+        cli = server.iface_slug(root)                       # what ticket._log writes
+        served = server._slugify(os.path.basename(root), set())   # what the hub indexes
+        self.assertEqual(cli, served)
+        self.assertEqual(cli, "clean-paste-lite")
+        self.assertNotEqual(cli, os.path.basename(root))    # and not the raw folder
+
+
 if __name__ == "__main__":
     unittest.main()

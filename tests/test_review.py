@@ -71,6 +71,16 @@ class ReviewSectionCase(unittest.TestCase):
         self.assertNotIn("## Reviewed", self.read())
         self.assertIn("## Notes\n\nKeep me.\n", self.read())
 
+    def test_the_tick_only_exists_on_closed_tickets(self):
+        # review is something you do to finished work
+        self.assertTrue(server.is_closed({"status": "CLOSED"}))
+        self.assertTrue(server.is_closed({"status": "closed"}))   # filter page buckets
+        for st in ("OPEN", "WONT_FIX", "STANDING", "", None):
+            self.assertFalse(server.is_closed({"status": st}), st)
+        self.assertEqual(server._review_chip({"id": "TK-1", "status": "OPEN"}), "")
+        chip = server._review_chip({"id": "TK-1", "status": "CLOSED"})
+        self.assertIn('data-review="TK-1"', chip)
+
     def test_plain_heading_and_vs16_variants_detected(self):
         for heading in ("## Reviewed", "## Reviewed ✅️"):
             server.set_reviewed(self.path, False)

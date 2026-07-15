@@ -258,7 +258,7 @@ _TICKET_TEMPLATE = """# %(tid)s · %(title)s
 
 ## Context
 
-_Why this ticket exists — the problem or need._
+%(context)s
 
 ## Approach
 
@@ -269,13 +269,90 @@ _How to solve it. Rough direction is fine; refine before starting work._
 - [ ] _Concrete, verifiable "done" checks._
 """
 
+# What the Context section says until someone says something better.
+_CONTEXT_STUB = "_Why this ticket exists — the problem or need._"
+
+# How many times `create` will re-try for a free id before giving up. A number
+# is only lost to a writer that beat us to it, so one or two rounds is realistic
+# and anything approaching this is a bug somewhere else.
+_ID_TRIES = 25
+
 
 def _log(repo, kind, tid):
     """Record a CLI mutation in the hub-wide event log — the same
     stream the dashboard writes to, so an automation watching for a
-    close hears it whether it came from a click or a command."""
+    close hears it whether it came from a click or a command.
+
+    The interface is named with the *same* slug the server uses, not the raw
+    folder name: they used to disagree wherever a folder name had an underscore,
+    which split one project's events across two keys."""
     events.record(kind, ticket=tid, repo=repo.root,
-                  interface=os.path.basename(repo.root.rstrip(os.sep)))
+                  interface=server.iface_slug(repo.root))
+
+
+def ticket_text(tid, title, eid, risk, priority, effort, depends=(), context=""):
+    """The full text of one ticket file. The only place a ticket's shape is
+    written down — the CLI and the dashboard's New-ticket form both come here."""
+    today = datetime.date.today().isoformat()
+    lines = ["id: %s" % tid,
+             "title: %s" % title,
+             "epic: %s" % eid,
+             "status: OPEN",
+             "risk: %s" % risk,
+             "priority: %d" % int(priority),
+             "effort: %s" % effort,
+             "created: %s" % today]
+    if depends:
+        lines.append("depends_on: [%s]" % ", ".join(depends))
+    lines.append("updated: %s" % today)
+    body = _TICKET_TEMPLATE % {"tid": tid, "title": title,
+                               "context": context.strip() or _CONTEXT_STUB}
+    return "---\n" + "\n".join(lines) + "\n---\n\n" + body
+
+
+def create(repo, title, eid, edir, risk="LOW", priority=3, effort="2h",
+           depends=(), context="", tid=None):
+    """Write one new ticket and return (id, path).
+
+    The id is allocated here, at the last possible moment, and never reserved
+    ahead of time: an agent may file a ticket between a form opening and its
+    save. So we take the next free number against a fresh scan, and create the
+    file with O_EXCL — a lost race then means "take the next number", not an
+    overwrite. Pass `tid` to demand a specific id, which raises if it is taken.
+
+    Writing the file is all this does — recording the event is left to the caller,
+    because the CLI and the server name the interface they act for differently.
+    """
+    title = " ".join(title.split())
+    want = (tid or "").strip()
+    for _ in range(_ID_TRIES):
+        cards, _problems = repo.cards()
+        by_id = _by_id(cards)
+        tid = want or repo.next_id(cards)
+        if not repo.id_re.match(tid):
+            raise ValueError("malformed id %r (expected e.g. %s-%0*d)"
+                             % (tid, repo.prefix, repo.digits, 1))
+        if tid in by_id:
+            if want:
+                raise ValueError("%s already exists: %s" % (tid, by_id[tid].path))
+            continue                    # somebody took the number; re-scan and move up
+        for dep in depends:
+            if dep not in by_id:
+                raise ValueError("depends_on references unknown ticket %s" % dep)
+        path = os.path.join(edir, "open", "%s-%s.md" % (tid, slugify(title)))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            if want:
+                raise ValueError("%s already exists: %s" % (tid, path))
+            continue                    # same race, caught one level down
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(ticket_text(tid, title, eid, risk, priority, effort,
+                                 depends, context))
+        return tid, path
+    raise RuntimeError("no free ticket id after %d tries — is something else "
+                       "writing tickets in a loop?" % _ID_TRIES)
 
 
 def cmd_new(args):
@@ -284,7 +361,6 @@ def cmd_new(args):
         sys.stderr.write("no tickets/ folder here — run `interfacile init` first.\n")
         return 1
     cards, _ = repo.cards()
-    by_id = _by_id(cards)
 
     eid, edir = repo.resolve_epic(args.epic)
     if not eid:
@@ -294,47 +370,21 @@ def cmd_new(args):
         sys.stderr.write("(create one with `interfacile epics`)\n")
         return 1
 
-    tid = (args.id or "").strip() or repo.next_id(cards)
-    if tid in by_id:
-        sys.stderr.write("%s already exists: %s\n" % (tid, by_id[tid].path))
-        return 1
-    if not repo.id_re.match(tid):
-        sys.stderr.write("malformed id %r (expected e.g. %s-%0*d)\n"
-                         % (tid, repo.prefix, repo.digits, 1))
-        return 1
-
-    depends = parse_ids(args.depends_on)
-    for dep in depends:
-        if dep not in by_id:
-            sys.stderr.write("--depends-on references unknown ticket %s\n" % dep)
-            return 1
-
-    today = datetime.date.today().isoformat()
-    title = " ".join(args.title.split())
-    lines = ["id: %s" % tid,
-             "title: %s" % title,
-             "epic: %s" % eid,
-             "status: OPEN",
-             "risk: %s" % args.risk,
-             "priority: %d" % args.priority,
-             "effort: %s" % args.effort,
-             "created: %s" % today]
-    if depends:
-        lines.append("depends_on: [%s]" % ", ".join(depends))
-    lines.append("updated: %s" % today)
-
-    path = os.path.join(edir, "open", "%s-%s.md" % (tid, slugify(title)))
-    text = ("---\n" + "\n".join(lines) + "\n---\n\n"
-            + _TICKET_TEMPLATE % {"tid": tid, "title": title})
-
     if args.dry_run:
+        tid = (args.id or "").strip() or repo.next_id(cards)
+        path = os.path.join(edir, "open",
+                            "%s-%s.md" % (tid, slugify(" ".join(args.title.split()))))
         print("[dry-run] %s -> %s" % (tid, os.path.relpath(path, repo.root)))
         return 0
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
-    print("%s created: %s" % (tid, os.path.relpath(path, repo.root)))
+
+    try:
+        tid, path = create(repo, args.title, eid, edir, args.risk, args.priority,
+                           args.effort, parse_ids(args.depends_on), tid=args.id)
+    except (ValueError, RuntimeError) as exc:
+        sys.stderr.write("%s\n" % exc)
+        return 1
     _log(repo, "new", tid)
+    print("%s created: %s" % (tid, os.path.relpath(path, repo.root)))
     print("Fill in Context / Approach / Acceptance criteria, then `interfacile lint`.")
     return 0
 

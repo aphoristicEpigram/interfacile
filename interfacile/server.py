@@ -44,6 +44,10 @@ REPO_ROOT = os.path.abspath(
 )
 TICKETS_DIR = os.path.join(REPO_ROOT, "tickets")
 
+# Every ticket that appears in the dependency graph, refreshed by each scan().
+# The card renderers ask it whether to offer a "trace the dependencies" control.
+DEP_IDS = set()
+
 # Deliberately empty. Epic names belong to an interface, never to the engine —
 # a repo gets them from its own .interfacile/config.json, or, failing that, from
 # its own epic charters (discover_epic_meta). Seeding these with one project's
@@ -727,6 +731,7 @@ def scan():
                 "effort": effort if effort_h is not None else "",
                 "effortH": effort_h, "epic": code, "wip": tid in wip_ids,
                 "pinned": tid in pins, "reviewed": is_reviewed(body),
+                "status": status,
                 "slug": os.path.basename(path)[:-3]}   # id-title filename, for "copy ids"
         node_meta[tid] = {"id": tid, "title": title, "status": status,
                           "created": _iso(cdate), "closed": _iso(xdate)}
@@ -893,6 +898,13 @@ def scan():
     all_edges = sorted({(b, t) for b, t in dep_edges
                         if b in node_meta and t in node_meta})
     dep_nodes = {i: node_meta[i] for e in all_edges for i in e}
+    # The server-rendered cards need the same "is this ticket in the graph?" test
+    # the dashboard's JS gets from depGraph.nodes, and they render deep inside
+    # helpers that never see the board. Request-scoped, like REPO_ROOT and PFX —
+    # a request holds _LOCK from scan() through render, so this cannot be a
+    # half-updated view of somebody else's board.
+    global DEP_IDS
+    DEP_IDS = set(dep_nodes)
 
     # Like-for-like comparison windows: [prev, cur] over equal elapsed spans.
     def _window(a, b):
@@ -1310,6 +1322,12 @@ color:var(--ink2);border-radius:7px;padding:7px 14px;cursor:pointer}
 background:color-mix(in srgb,var(--done) 14%,transparent)}
 a.tb.dep{text-decoration:none;color:var(--accent);border-color:var(--accent)}
 a.tb.dep:hover{background:var(--surface2);filter:brightness(1.05)}
+/* Blocked is a warning; unblocked is the good news — the transition you most
+   want to catch, and the one a single neutral colour used to bury (IF-0104). */
+a.tb.dep.blocked{color:var(--warn);border-color:var(--warn);
+background:color-mix(in srgb,var(--warn) 10%,transparent)}
+a.tb.dep.clear{color:var(--done);border-color:var(--done);font-weight:700;
+background:color-mix(in srgb,var(--done) 14%,transparent)}
 .editmsg{font-family:var(--mono);font-size:.74rem;color:var(--mut)}
 .editmsg.ok{color:var(--done)}.editmsg.err{color:#d64545}
 .editor{width:100%;min-height:62vh;font-family:var(--mono);font-size:.82rem;line-height:1.55;color:var(--ink);
@@ -1466,32 +1484,58 @@ def _family_block(kids):
     rows = ""
     for k in kids:
         sub = (" <span class='subn'>%d sub</span>" % k["n_sub"]) if k["n_sub"] else ""
+        # A table row, not a card: the id is already the first column, so the
+        # controls go at the end of the row where a table's actions belong.
         rows += (
             "<tr><td class='k'><a href='/ticket/%s'%s>%s</a></td>"
-            "<td class='v'><span class='badge %s'>%s</span> %s%s</td></tr>" % (
+            "<td class='v'><span class='badge %s'>%s</span> %s%s"
+            "<span class='row-tools'>%s</span></td></tr>" % (
                 urllib.parse.quote(k["id"]), _a_data(k), html.escape(k["id"]),
                 STATUS_BADGE.get(k["status"], "b-wf"), html.escape(k["status"] or "?"),
-                html.escape(k["title"]), sub))
+                html.escape(k["title"]), sub,
+                _id_tools(k["id"], anchor_safe=False)))
     return ("<div class='fm fam'><div class='fm-h fam-h'>sub-tickets (%d)%s</div>"
             "<table id='famList'><tbody>%s</tbody></table></div>"
             % (len(kids), _list_tools("#famList", "sub-tickets"), rows))
 
 
 def _dep_button(tid, dep_graph):
-    """Link to the dependency explorer, when this ticket is in the graph."""
+    """Link to the dependency explorer, when this ticket is in the graph.
+
+    Blockers are counted by whether they are still *open*, not by how many edges
+    point at this ticket — a closed blocker is a satisfied one. Counting edges is
+    what had a ready ticket reading "blocked by 3" on the very screen you open to
+    decide whether you can start it, while the board's own `blocked` flag (which
+    has always asked the right question) said otherwise (IF-0104).
+
+    Three states, because "not blocked" hides the one worth noticing: a ticket
+    that *was* waiting and now isn't."""
     if not dep_graph or tid not in dep_graph["nodes"]:
         return ""
-    blocked_by = sum(1 for b, t in dep_graph["edges"] if t == tid)
-    blocks = sum(1 for b, t in dep_graph["edges"] if b == tid)
-    bits = []
-    if blocked_by:
-        bits.append("blocked by %d" % blocked_by)
-    if blocks:
-        bits.append("blocks %d" % blocks)
+    from . import ticket as tk        # DONE lives with the rest of the ticket rules
+    nodes = dep_graph["nodes"]
+
+    def satisfied(i):
+        return (nodes.get(i, {}).get("status") or "").upper() in tk.DONE
+
+    blockers = [b for b, t in dep_graph["edges"] if t == tid]
+    holding = [b for b in blockers if not satisfied(b)]
+    blocks_open = [t for b, t in dep_graph["edges"] if b == tid and not satisfied(t)]
+
+    if holding:
+        cls, mark, state = "blocked", "&#9741;", "blocked by %d" % len(holding)
+    elif blockers:
+        cls, mark, state = ("clear", "&#10003;",
+                            "unblocked &mdash; all %d cleared" % len(blockers))
+    else:
+        cls, mark, state = "", "&#9741;", ""
+    bits = [b for b in (state, "blocks %d" % len(blocks_open) if blocks_open else "") if b]
     sub = (" &middot; " + " &middot; ".join(bits)) if bits else ""
-    return ('<a class="tb dep" href="/deps?id=%s" title="Trace this ticket&#39;s'
-            ' blockers and what it unlocks">&#9741; Dependency graph%s</a>'
-            % (urllib.parse.quote(tid), sub))
+    tip = ("Every blocker is closed &mdash; this is ready to start"
+           if (blockers and not holding) else
+           "Trace this ticket&#39;s blockers and what it unlocks")
+    return ('<a class="tb dep %s" href="/deps?id=%s" title="%s">%s Dependency graph%s</a>'
+            % (cls, urllib.parse.quote(tid), tip, mark, sub))
 
 
 def render_ticket_page(path, known_ids=None, known_epics=None, adrs=None,
@@ -1527,9 +1571,12 @@ def render_ticket_page(path, known_ids=None, known_epics=None, adrs=None,
     parent, kids = _family(tid, id_index or {})
     parent_crumb = ""
     if parent:
+        # The parent's id, copyable from the child — the breadcrumb used to name
+        # it and give you nothing to grab (IF-0105).
         parent_crumb = ('&nbsp;&middot;&nbsp; <a class="back" href="/ticket/'
                         + urllib.parse.quote(parent) + '">&uarr; parent '
-                        + html.escape(parent) + '</a>')
+                        + html.escape(parent) + '</a>'
+                        + _id_tools(parent, anchor_safe=False))
 
     rel = html.escape(os.path.relpath(path, REPO_ROOT))
     raw = html.escape(text)
@@ -1554,11 +1601,13 @@ def render_ticket_page(path, known_ids=None, known_epics=None, adrs=None,
         "<span class='editmsg' id='editMsg'></span>"
         "<button class='tb pin' id='pinBtn' type='button' data-pinned='"
         + ("1" if pinned else "0") + "'>&#128278;</button>"
-        "<button class='tb revchip" + (" on" if reviewed else "") + "' type='button'"
-        " aria-checked='" + ("true" if reviewed else "false") + "'"
-        " data-review='" + html.escape(tid, quote=True) + "'"
-        " title='Code reviewed &mdash; click to toggle'>&#10003; Reviewed</button>"
-        "<button class='tb copy-one' type='button' data-copy='"
+        # the tick is for finished work — an open ticket has nothing to review
+        + ("<button class='tb revchip" + (" on" if reviewed else "") + "' type='button'"
+           " aria-checked='" + ("true" if reviewed else "false") + "'"
+           " data-review='" + html.escape(tid, quote=True) + "'"
+           " title='Code reviewed &mdash; click to toggle'>&#10003; Reviewed</button>"
+           if status == "CLOSED" else "")
+        + "<button class='tb copy-one' type='button' data-copy='"
         + html.escape(os.path.basename(path)[:-3], quote=True)
         + "' title='Copy this ticket&#39;s id'>&#128203; Copy</button></div>"
         "<div id='view'>"
@@ -1754,6 +1803,10 @@ background-repeat:no-repeat;background-position:right 9px center}
 .mchip.pinned{color:var(--warn);border-color:var(--warn)}
 .mchip.pinned[data-unpin]{cursor:pointer}
 .mchip.pinned[data-unpin]:hover,.mchip.pinned[data-unpin]:focus-visible{color:#c23b3b;border-color:#c23b3b;text-decoration:line-through}
+.mchip.copy-one{cursor:pointer;opacity:.45;border-color:transparent;background:none;padding:0 4px;
+appearance:none;-webkit-appearance:none;margin:0}
+.mchip.copy-one:hover,.mchip.copy-one:focus-visible{opacity:1;color:var(--accent);border-color:var(--accent)}
+.col li:hover .mchip.copy-one{opacity:.7}
 /* the unpinned pin: invisible until you're on the row, so a list of 40 tickets
    doesn't read as a list of 40 buttons */
 .mchip.pin-add{cursor:pointer;opacity:0;border-color:transparent;transition:opacity .12s}
@@ -2089,10 +2142,10 @@ def _epic_ticket_li(t, is_child, datekey, today, show_epic=False):
         if d:
             dlab = "%s · %dd old" % (date, (today - d).days)
     return ('<li class="%s"%s><a href="/ticket/%s"%s>'
-            '<span class="tk-id">%s</span><span class="tk-ttl">%s</span>'
+            '<span class="tk-id">%s</span>%s<span class="tk-ttl">%s</span>'
             '<span class="tk-meta">%s%s</span></a></li>' % (
                 "child" if is_child else "", _li_attrs(t, date), html.escape(t["id"]), _a_data(t),
-                html.escape(t["id"]), html.escape(t["title"]), chips,
+                html.escape(t["id"]), _id_tools(t["id"]), html.escape(t["title"]), chips,
                 ('<span class="tk-date">%s</span>' % html.escape(dlab)) if dlab else ""))
 
 
@@ -2156,6 +2209,30 @@ def pocket_js():
     return _POCKET_JS.replace("__POCKET_WINDOWS__", json.dumps(wins))
 
 
+def _id_tools(tid, anchor_safe=True):
+    """Copy-the-id and trace-its-dependencies, together, hard against the ticket
+    id — the same pair in the same place on every card (IF-0105).
+
+    `anchor_safe`: a card is one big `<a>`, and an `<a>` inside an `<a>` is invalid
+    HTML that browsers silently unnest. So on a card the dependency control is a
+    `role="link"` span routed by the delegated click handler the epic chips already
+    use. In a table row (sub-tickets, breadcrumbs) there is no wrapping anchor and
+    it can be a real link — which is what you want: middle-click, open in a new tab."""
+    copy = ('<button type="button" class="mchip copy-one" data-copy="%s" '
+            'title="copy ticket id">&#10697;</button>' % html.escape(tid, quote=True))
+    dep = ""
+    if tid in DEP_IDS:
+        if anchor_safe:
+            dep = ('<span class="mchip dep-link" role="link" tabindex="0" data-dep="%s"'
+                   ' title="trace this ticket&#39;s dependencies">&#9741;</span>'
+                   % html.escape(tid, quote=True))
+        else:
+            dep = ('<a class="mchip dep-link" href="/deps?id=%s"'
+                   ' title="trace this ticket&#39;s dependencies">&#9741;</a>'
+                   % urllib.parse.quote(tid))
+    return '<span class="id-tools">%s%s</span>' % (copy, dep)
+
+
 def _pin_chip(tid, pinned):
     """Pin/unpin from any list. Pinned reads at a glance (🔖, always visible);
     unpinned is a quiet 📌 that surfaces on hover — pinning is the action you
@@ -2214,10 +2291,19 @@ def _tags(t):
     return out
 
 
+def is_closed(t):
+    """Review is a thing you do to finished work — so the tick only exists on
+    a closed ticket. Statuses arrive uppercase from frontmatter and lowercase
+    from the filter page's own buckets; both mean the same thing."""
+    return str(t.get("status") or "").upper() == "CLOSED"
+
+
 def _review_chip(t):
-    """The code-review tick: a checkbox that persists per ticket (review.json).
-    Same in-place toggle pattern as the pin chip — the shared list script owns
-    the click."""
+    """The code-review tick: a checkbox that writes `## Reviewed ✅` into the
+    ticket. Same in-place toggle pattern as the pin chip — the shared list
+    script owns the click. Closed tickets only; nothing to review before then."""
+    if not is_closed(t):
+        return ""
     on = bool(t.get("reviewed"))
     return ('<span class="mchip revchip%s" role="checkbox" tabindex="0"'
             ' aria-checked="%s" data-review="%s"'
@@ -2250,11 +2336,9 @@ def _grid_row(t, is_child, datekey, today, show_status):
         if d:
             age = '<span class="g-age">%dd</span>' % (today - d).days
     cells = [
-        '<span class="g-id">%s%s<button type="button" class="g-copy copy-one"'
-        ' data-copy="%s" title="copy %s">&#10697;</button></span>' % (
+        '<span class="g-id">%s%s%s</span>' % (
             '<span class="g-sub" title="sub-ticket">&#8627;</span>' if is_child else "",
-            html.escape(t["id"]),
-            html.escape(t["id"], quote=True), html.escape(t["id"])),
+            html.escape(t["id"]), _id_tools(t["id"])),
         '<span class="g-ttl">%s</span>' % html.escape(t["title"]),
         ('<span class="g-epic"><span class="mchip epic-link" role="link"'
          ' tabindex="0" data-epic="%s" title="open the __PFX__-%s epic page">'
@@ -2718,10 +2802,15 @@ display:flex;flex-direction:column;gap:3px;position:relative}
 section{margin-top:40px;scroll-margin-top:64px}
 @media (prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}}
 .qnav{position:sticky;top:10px;z-index:20;display:flex;flex-wrap:wrap;gap:2px;margin-top:14px;padding:5px;
-background:var(--surface);border:1px solid var(--line);border-radius:100px;box-shadow:var(--shadow);width:fit-content}
+background:var(--surface);border:1px solid var(--line);border-radius:100px;box-shadow:var(--shadow);width:100%;box-sizing:border-box;align-items:center}
+.qnav-sec{display:flex;flex-wrap:wrap;gap:2px}
+.qnav-links{display:flex;flex-wrap:wrap;gap:2px;margin-left:auto}
 .qnav a{font-family:var(--font-mono);font-size:.72rem;color:var(--ink-2);text-decoration:none;padding:5px 12px;border-radius:100px;white-space:nowrap}
 .qnav a:hover{background:var(--surface-2);color:var(--accent-ink)}
 .qnav a b{color:var(--accent-ink);font-weight:600;margin-right:6px}
+.qnav-links a.ql-open{color:var(--accent-ink)}
+.qnav-links a.ql-closed{color:var(--done)}
+.qnav-links a:hover{background:var(--surface-2)}
 .sec-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:14px}
 h2{font-size:1.28rem;font-weight:700;letter-spacing:-.02em;margin:0;display:flex;align-items:baseline;gap:11px}
 h2 .h-num{font-family:var(--font-mono);font-size:.82rem;color:var(--accent-ink);font-weight:600}
@@ -2970,10 +3059,14 @@ background:color-mix(in srgb,var(--warn) 12%,transparent)}
 /* dependency chip: quiet until you go looking for it — a square, like the tick.
    It leads the chip line from the card's far left, away from the tags */
 .b-meta.dep{border-color:transparent;color:var(--ink-mut);opacity:.42;cursor:pointer;font-size:.78rem;
-width:22px;height:22px;padding:0;display:inline-flex;align-items:center;justify-content:center}
-.b-right .b-meta.dep{margin-right:auto}
-.b-list a:hover .b-meta.dep{opacity:.85}
+width:22px;height:22px;padding:0;display:inline-flex;align-items:center;justify-content:center;vertical-align:middle}
+.b-list a:hover .b-meta.dep,.recent a:hover .b-meta.dep{opacity:.85}
 .b-meta.dep:hover,.b-meta.dep:focus-visible{opacity:1;color:var(--accent-ink);border-color:var(--accent-ink)}
+.b-meta.copy{border-color:transparent;color:var(--ink-mut);opacity:.45;cursor:pointer;font-size:.78rem;
+width:22px;height:22px;padding:0;display:inline-flex;align-items:center;justify-content:center;vertical-align:middle;
+appearance:none;-webkit-appearance:none;margin:0}
+.b-list a:hover .b-meta.copy,.recent a:hover .b-meta.copy{opacity:.85}
+.b-meta.copy:hover,.b-meta.copy:focus-visible{opacity:1;color:var(--accent-ink);border-color:var(--accent-ink)}
 /* chart table view */
 .ctable{max-height:260px;overflow:auto;border:1px solid var(--line-2);border-radius:6px}
 .ctable table{border-collapse:collapse;width:100%;font-size:.74rem;font-family:var(--font-mono);font-variant-numeric:tabular-nums}
@@ -3003,6 +3096,14 @@ padding:2px 0;flex:none;width:58px;text-align:center}
 .g-id{font-family:var(--font-mono);font-size:.74rem;font-weight:600;color:var(--accent-ink);flex:none;min-width:92px}
 .g-ttl{font-size:.85rem;color:var(--ink-2);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .g-sub{font-family:var(--font-mono);font-size:.66rem;color:var(--ink-mut);flex:none}
+/* pin a result without opening it (IF-0106); rides at the row's right edge */
+.g-pin{flex:none;margin-left:6px;align-self:center;width:24px;height:24px;border-radius:6px;
+cursor:pointer;display:inline-flex;align-items:center;justify-content:center;font-size:.86rem;
+opacity:.4;filter:grayscale(1);border:1px solid transparent;line-height:1}
+.gdrop a:hover .g-pin,.gdrop a.active .g-pin{opacity:.7}
+.g-pin:hover,.g-pin:focus-visible{opacity:1;filter:none;border-color:var(--accent);background:var(--surface)}
+.g-pin.on{opacity:1;filter:none}
+.g-pin.on:hover{border-color:#c23b3b}
 .g-empty{padding:10px 12px;font-size:.78rem;color:var(--ink-mut);font-family:var(--font-mono)}
 .track .t-list a{color:var(--accent-ink);text-decoration:none}
 .track .t-list a:hover{text-decoration:underline}
@@ -3163,6 +3264,14 @@ border-radius:9px;padding:12px 12px 11px;text-decoration:none;color:inherit;posi
 /* pinned + wip strip at the top */
 .topstrip{margin-top:16px}
 .topstrip.solo{grid-template-columns:1fr}
+/* Cap the two list bodies at ~12 rows, then scroll within, so a long pinned or
+   WIP list can't push the whole board down the page (IF-0107). The cap is on the
+   list body, not the panel, so each panel's header and its copy/pin/CSV tools
+   stay put above the scroll. Aligns to the top strip so both panels match. */
+#pinnedList,#wipList{max-height:40rem;overflow-y:auto;overscroll-behavior:contain}
+#pinnedList::-webkit-scrollbar,#wipList::-webkit-scrollbar{width:8px}
+#pinnedList::-webkit-scrollbar-thumb,#wipList::-webkit-scrollbar-thumb{
+background:var(--line);border-radius:8px}
 .pin-x{font-family:var(--font-mono);font-size:.66rem;border:1px solid var(--line);background:var(--surface-2);
 color:var(--ink-mut);border-radius:5px;padding:2px 7px;cursor:pointer;flex:none}
 .pin-x:hover{border-color:#c23b3b;color:#c23b3b}
@@ -3234,13 +3343,19 @@ section.collapsed .sec-head{margin-bottom:0}
   </header>
   <!--NOTES_PANEL-->
   <nav class="qnav" aria-label="Jump to section">
-    <a href="#sec-health"><b>01</b>Health</a>
-    <a href="#sec-prioritize"><b>02</b>Prioritize</a>
-    <a href="#sec-activity"><b>03</b>Activity</a>
-    <a href="#sec-backlog"><b>04</b>Backlog</a>
-    <a href="#sec-chains"><b>05</b>Dependencies</a>
-    <a href="#sec-tracks"><b>06</b>Standing</a>
-    <a href="#sec-epics"><b>07</b>Epics</a>
+    <div class="qnav-sec">
+      <a href="#sec-health"><b>01</b>Health</a>
+      <a href="#sec-prioritize"><b>02</b>Prioritize</a>
+      <a href="#sec-activity"><b>03</b>Activity</a>
+      <a href="#sec-backlog"><b>04</b>Backlog</a>
+      <a href="#sec-chains"><b>05</b>Dependencies</a>
+      <a href="#sec-tracks"><b>06</b>Standing</a>
+      <a href="#sec-epics"><b>07</b>Epics</a>
+    </div>
+    <div class="qnav-links">
+      <a class="ql-open" href="/filter?status=open&amp;label=All%20open" title="All open tickets">All open</a>
+      <a class="ql-closed" href="/filter?status=closed&amp;label=All%20closed" title="All closed tickets">All closed</a>
+    </div>
   </nav>
   <div class="kpis">
     <div class="kpi clickable" data-href="/filter?label=All%20tickets" title="Click for the full ticket list"><span class="k-val" id="k-total">&mdash;</span><span class="k-lab">Tickets tracked</span><span class="k-sub" id="k-total-sub">&nbsp;</span></div>
@@ -3254,7 +3369,7 @@ section.collapsed .sec-head{margin-bottom:0}
   </div>
   <div class="duo topstrip" id="topstrip">
     <div class="recent" id="pinnedPanel"><div class="panel-h ph-tools"><a class="ph-link" href="/filter?pinned=1&amp;label=Pinned" title="Open as a sortable list">&#128278; Pinned &middot; watching</a><span class='list-tools' data-src='#pinnedList' data-name='pinned' data-sort='1'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-unpin' title='Unpin everything in this list'>unpin all</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="pinnedList"></div></div>
-    <div class="recent" id="wipPanel"><div class="panel-h ph-tools"><a class="ph-link" href="/filter?wip=1&amp;label=Work%20in%20progress" title="Open as a sortable list">&#128295; Work in progress &middot; git working tree</a><span class='list-tools' data-src='#wipList' data-name='wip' data-sort='1'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-pin' title='Pin every ticket in this list'>pin all</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="wipList"></div></div>
+    <div class="recent" id="wipPanel"><div class="panel-h ph-tools"><a class="ph-link" href="/filter?wip=1&amp;label=WIP" title="Open as a sortable list">&#128295; WIP &middot; git working tree</a><span class='list-tools' data-src='#wipList' data-name='wip' data-sort='1'><button type='button' class='lt-copy'>copy ids</button><button type='button' class='lt-pin' title='Pin every ticket in this list'>pin all</button><button type='button' class='lt-csv'>CSV</button></span></div><div id="wipList"></div></div>
   </div>
   <section id="sec-health">
     <div class="sec-head"><h2><span class="h-num">01</span>Program health</h2>
@@ -3264,7 +3379,7 @@ section.collapsed .sec-head{margin-bottom:0}
         <button type="button" data-bucket="month" aria-pressed="false">month</button>
       </div>
     </div>
-    <p class="sec-note">Throughput &amp; completion over time. The bucket toggle scopes both charts; comparison tiles pit the current period against the previous one.</p>
+    <p class="sec-note">Throughput &amp; completion over time — toggle scopes charts, tiles compare periods.</p>
     <div class="kpis" id="healthTiles"></div>
     <div class="charts">
       <figure class="chart">
@@ -3505,11 +3620,24 @@ section.collapsed .sec-head{margin-bottom:0}
     return out?'<span class="b-metas">'+out+'</span>':"";
   }
   function depChip(t){
-    /* leads the chip line from the card's other side, apart from the tags */
     return DEPIDS[t.id]?'<span class="b-meta act dep" role="link" tabindex="0" data-dep="'+esc(t.id)+
       '" title="trace this ticket\'s dependencies">&#9741;</span>':"";
   }
+  function copyChip(t){
+    return '<button type="button" class="b-meta act copy copy-one" data-copy="'+esc(t.id)+
+      '" title="copy ticket id">&#10697;</button>';
+  }
+  /* The two things you want *about* a ticket without opening it, kept together at
+     the LEFT of the tag line — the pressable pair on one side, the readable chips
+     on the other. They used to be loose in that row with `margin-right:auto` on
+     whichever happened to come first, so copy sat left on a ticket with no
+     dependencies and jumped right on one that had them: the control you reach for
+     most often had no fixed home (IF-0105). */
+  function idTools(t){return '<span class="b-tools">'+copyChip(t)+depChip(t)+'</span>';}
+  function isClosed(t){return String(t.status||"").toUpperCase()==="CLOSED";}
   function revChip(t){
+    /* review is for finished work: the tick only exists once a ticket closes */
+    if(!isClosed(t))return "";
     return '<span class="b-meta revchip'+(t.reviewed?' on':'')+'" role="checkbox" tabindex="0"'+
       ' aria-checked="'+(t.reviewed?'true':'false')+'" data-review="'+esc(t.id)+
       '" title="code reviewed — click to toggle">&#10003;</span>';
@@ -3594,7 +3722,7 @@ section.collapsed .sec-head{margin-bottom:0}
     function row(it,extra,drag){
       /* doc pins link to their /doc/ page and skip the ticket-only badges */
       var href=it.doc?'/doc/'+encodeURI(it.doc):'/ticket/'+encodeURIComponent(it.id);
-      var meta=(it.doc?'':depChip(it)+metaBadges(it,false))+extra;
+      var meta=(it.doc?'':idTools(it)+metaBadges(it,false))+extra;
       return '<a href="'+href+'"'+(it.doc?'':dataAttrs(it))+
         (drag?' draggable="true" data-pin-key="'+esc(it.doc||it.id)+'" title="drag to reorder"':'')+'>'+
         '<span class="b-body"><span class="b-line1">'+
@@ -3608,11 +3736,11 @@ section.collapsed .sec-head{margin-bottom:0}
       return row(it,"",true);
     }).join("")||'<div class="chart-empty">Nothing pinned — use the 🔖 rail button on any row, or the one at the top of any ticket or doc page.</div>';
     var wPanel=document.getElementById("wipPanel");
-    var shown=wip.slice(0,8),more=wip.length-shown.length;
-    document.getElementById("wipList").innerHTML=shown.map(function(it){
+    // Render the whole list: the panel body is height-capped and scrolls (IF-0107),
+    // so a long list stays reachable without a "+N more" trip off the board.
+    document.getElementById("wipList").innerHTML=wip.map(function(it){
       return row(it,'<span class="b-date">'+relTime(it.when)+'</span>');
-    }).join("")+(more>0?'<a href="/filter?wip=1&label=Work%20in%20progress%20(working%20tree)">'+
-      '<span class="b-ttl" style="color:var(--accent-ink)">+'+more+' more →</span></a>':'');
+    }).join("");
     wPanel.hidden=!wip.length;
     strip.classList.toggle("solo",!wip.length);
   }
@@ -4077,7 +4205,7 @@ section.collapsed .sec-head{margin-bottom:0}
     var chip=isDec?'<span class="b-dec">decision</span>':
       view==="wf"?'<span class="b-dec">won\'t-fix</span>':
       view==="standing"?'<span class="b-dec">standing</span>':'';
-    var meta=depChip(it)+metaBadges(it,withEpic)+(date?'<span class="b-date">'+date+'</span>':'');
+    var meta=idTools(it)+metaBadges(it,withEpic)+(date?'<span class="b-date">'+date+'</span>':'');
     return '<li><a class="'+(view==="closed"?"closed":"")+'" href="/ticket/'+encodeURIComponent(it.id)+
       '"'+dataAttrs(it)+'><span class="b-body"><span class="b-line1">'+
       '<span class="b-tid">'+esc(it.id)+'</span>'+
@@ -4086,7 +4214,7 @@ section.collapsed .sec-head{margin-bottom:0}
       '<span class="b-rail">'+revChip(it)+pinChip(it)+'</span></a></li>';
   }
   function recentRow(it,datefield,tidColor,extra){
-    var meta=depChip(it)+metaBadges(it,false)+extra+'<span class="b-date">'+(it[datefield]||"")+'</span>';
+    var meta=idTools(it)+metaBadges(it,false)+extra+'<span class="b-date">'+(it[datefield]||"")+'</span>';
     return '<a href="/ticket/'+encodeURIComponent(it.id)+'"'+dataAttrs(it)+'>'+
       '<span class="b-body"><span class="b-line1">'+
       '<span class="b-tid"'+(tidColor?' style="color:'+tidColor+'"':'')+'>'+esc(it.id)+'</span>'+
@@ -4316,18 +4444,8 @@ section.collapsed .sec-head{margin-bottom:0}
     ev.preventDefault();ev.stopPropagation();
     location.href="/epic/"+ch.getAttribute("data-epic");
   },true);
-  // Dependency chips do the same, routing to the explorer focused on that ticket.
-  document.addEventListener("click",function(ev){
-    var ch=ev.target.closest(".b-meta[data-dep]");if(!ch)return;
-    ev.preventDefault();ev.stopPropagation();
-    location.href="/deps?id="+encodeURIComponent(ch.getAttribute("data-dep"));
-  },true);
-  document.addEventListener("keydown",function(ev){
-    if(ev.key!=="Enter")return;
-    var ch=ev.target&&ev.target.closest?ev.target.closest(".b-meta[data-dep]"):null;
-    if(!ch)return;ev.preventDefault();
-    location.href="/deps?id="+encodeURIComponent(ch.getAttribute("data-dep"));
-  });
+  // Dependency chips route to the explorer from wherever they are — one handler
+  // for every page, injected with the card-tool styles (see _CARD_TOOLS).
   // The rail's pin toggle sits inside ticket links; flip it via the API and
   // refresh the board so the pinned panel agrees.
   document.addEventListener("click",function(ev){
@@ -4351,6 +4469,13 @@ section.collapsed .sec-head{margin-bottom:0}
     var list=document.getElementById("pinnedList"),dragging=null,dragEnd=0;
     list.addEventListener("dragstart",function(e){
       var a=e.target.closest("a[data-pin-key]");if(!a)return;
+      // Dragging is manual ordering, and it wins over the display sort — which
+      // otherwise snaps the row straight back, because its MutationObserver
+      // re-sorts on the very insertBefore the drag uses (IF-0108). Resetting the
+      // select to "default" makes that observer stand down; setting .value fires
+      // no change event, so the on-screen order is left exactly as it looks.
+      var ss=document.querySelector('.list-tools[data-src="#pinnedList"] .lt-sort');
+      if(ss&&ss.value!=="default")ss.value="default";
       dragging=a;a.classList.add("pin-drag");
       e.dataTransfer.effectAllowed="move";
       try{e.dataTransfer.setData("text/plain",a.getAttribute("data-pin-key"));}catch(err){}
@@ -4468,12 +4593,24 @@ section.collapsed .sec-head{margin-bottom:0}
         (e[bk[0]]||[]).forEach(function(t){
           if(!matchQ(t,q))return;
           var r={kind:bk[1],href:"/ticket/"+encodeURIComponent(t.id),id:t.id,
-                 title:t.title,sub:(e.emoji?e.emoji+" ":"")+"__PFX__-"+e.id};
+                 title:t.title,sub:(e.emoji?e.emoji+" ":"")+"__PFX__-"+e.id,
+                 pinnable:true,pinned:!!t.pinned};
           (t.id.toLowerCase()===q||t.id.toLowerCase()==="em-"+qe?exact:rest).push(r);
         });
       });
     });
     return exact.concat(rest);
+  }
+  function gPin(r){
+    /* Tickets only. The row is an <a>, so this is a role="button" span caught by
+       a delegated handler before the row's link fires — the same trick the rail
+       pin chip uses (IF-0106). tabindex=-1: the row owns Tab, the toggle is
+       reached from it (see the keydown handler). */
+    if(!r.pinnable)return "";
+    return '<span class="g-pin'+(r.pinned?' on':'')+'" role="button" tabindex="-1"'+
+      ' data-gpin="'+esc(r.id)+'" aria-pressed="'+(r.pinned?'true':'false')+'"'+
+      ' title="'+(r.pinned?'pinned — click to unpin':'pin to the watching panel')+
+      '">&#128278;</span>';
   }
   function gRender(){
     var rows=gRes.slice(0,G_MAX).map(function(r,i){
@@ -4481,7 +4618,7 @@ section.collapsed .sec-head{margin-bottom:0}
         '<span class="g-kind k-'+(r.cls||r.kind)+'">'+r.kind+'</span>'+
         (r.emo?'<span class="g-emo">'+r.emo+'</span>':'')+
         '<span class="g-id">'+esc(r.id)+'</span><span class="g-ttl">'+esc(r.title)+'</span>'+
-        '<span class="g-sub">'+esc(r.sub||"")+'</span></a>';
+        '<span class="g-sub">'+esc(r.sub||"")+'</span>'+gPin(r)+'</a>';
     }).join("");
     if(gRes.length>G_MAX)rows+='<div class="g-empty">'+(gRes.length-G_MAX)+' more — keep typing to narrow</div>';
     gDrop.innerHTML=rows;gDrop.hidden=false;gIn.setAttribute("aria-expanded","true");
@@ -4498,6 +4635,20 @@ section.collapsed .sec-head{margin-bottom:0}
   }
   gIn.addEventListener("input",gUpdate);
   gIn.addEventListener("focus",function(){if(gIn.value.trim())gUpdate();});
+  // Pin/unpin the highlighted result. Same fetch + board refresh the rail chip
+  // uses, so the pinned panel agrees a beat later; the result's own state flips
+  // now so the icon updates without waiting on the round trip.
+  function gTogglePin(r){
+    if(!r||!r.pinnable||r._pinbusy)return;
+    r._pinbusy=true;r.pinned=!r.pinned;gRender();
+    fetch("/api/pin",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id:r.id,pinned:r.pinned})})
+      .then(function(res){return res.json();})
+      .then(function(res){r._pinbusy=false;
+        if(res&&res.ok===false){r.pinned=!r.pinned;gRender();return;}  /* server said no — revert */
+        load();})                                       /* refresh the pinned panel */
+      .catch(function(){r._pinbusy=false;r.pinned=!r.pinned;gRender();});
+  }
   gIn.addEventListener("keydown",function(e){
     if(e.key==="Escape"){gIn.value="";gClose();gIn.blur();return;}
     if(!gRes.length)return;
@@ -4506,6 +4657,16 @@ section.collapsed .sec-head{margin-bottom:0}
     else if(e.key==="ArrowUp"){e.preventDefault();gAct=(gAct-1+vis)%vis;gRender();}
     else if(e.key==="Enter"){e.preventDefault();
       var r=gRes[Math.max(0,gAct)];if(r)location.href=r.href;}
+    // pin the highlighted result without leaving the box
+    else if((e.key==="p"||e.key==="P")&&!e.metaKey&&!e.ctrlKey&&!e.altKey){
+      var rp=gRes[Math.max(0,gAct)];
+      if(rp&&rp.pinnable){e.preventDefault();gTogglePin(rp);}}
+  });
+  gDrop.addEventListener("click",function(ev){
+    var p=ev.target.closest("[data-gpin]");if(!p)return;
+    ev.preventDefault();ev.stopPropagation();
+    var id=p.getAttribute("data-gpin"),i;
+    for(i=0;i<gRes.length;i++){if(gRes[i].pinnable&&gRes[i].id===id){gTogglePin(gRes[i]);break;}}
   });
   document.addEventListener("click",function(ev){
     if(!ev.target.closest(".gsearch-row"))gClose();
@@ -5346,6 +5507,9 @@ background:var(--surface-2);border:1px solid var(--line);border-radius:7px}
 .fc-epic{font-family:var(--font-mono);font-size:.68rem;color:var(--ink-mut);text-decoration:none;
 border:1px solid var(--line);border-radius:5px;padding:2px 7px;background:var(--surface)}
 .fc-epic:hover{border-color:var(--accent);color:var(--accent-ink)}
+.fc-copy{font:inherit;font-size:.78rem;border:0;background:none;color:var(--ink-mut);cursor:pointer;padding:0;line-height:1;opacity:.45;
+appearance:none;-webkit-appearance:none;margin:0}
+.fc-copy:hover,.fc-copy:focus-visible{color:var(--accent-ink);opacity:1}
 /* unfocused overview */
 .ov{padding:4px 2px 2px}
 .ov-grid{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(258px,1fr));margin-top:10px}
@@ -5355,6 +5519,9 @@ border-radius:7px;background:var(--surface);text-decoration:none;color:inherit}
 .ov-id{font-family:var(--font-mono);font-size:.7rem;font-weight:700;color:var(--accent-ink);flex:none}
 .ov-ttl{font-size:.76rem;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ov-n{margin-left:auto;font-family:var(--font-mono);font-size:.66rem;color:var(--warn);flex:none}
+.ov-copy{font:inherit;font-size:.72rem;border:0;background:none;color:var(--ink-mut);cursor:pointer;padding:0 3px;line-height:1;opacity:.35;
+appearance:none;-webkit-appearance:none;margin:0}
+.ov-card:hover .ov-copy,.ov-copy:hover,.ov-copy:focus-visible{opacity:.75;color:var(--accent-ink)}
 .ov h4{margin:0;font-size:.82rem}
 .ov p{margin:4px 0 0;font-size:.76rem;color:var(--ink-mut)}
 .hop-lists{display:grid;gap:16px}
@@ -5367,6 +5534,10 @@ color:var(--ink-mut);margin:0 0 4px}
 .hop li a{display:inline-flex;gap:6px;align-items:center;font-family:var(--font-mono);font-size:.68rem;
 border:1px solid var(--line);border-radius:5px;padding:2px 7px;text-decoration:none;background:var(--surface)}
 .hop li a:hover{border-color:var(--warn)}
+.hop li{position:relative;display:flex;align-items:center;gap:2px}
+.hop-copy{font:inherit;font-size:.68rem;border:0;background:none;color:var(--ink-mut);cursor:pointer;padding:0 3px;line-height:1;opacity:0;
+appearance:none;-webkit-appearance:none;margin:0}
+.hop li:hover .hop-copy,.hop-copy:hover,.hop-copy:focus-visible{opacity:.7;color:var(--accent-ink)}
 .hop li a .st{width:6px;height:6px;border-radius:50%}
 .st-open{background:var(--accent)}.st-closed{background:var(--done)}.st-wf{background:var(--wf)}
 .legend-row{display:flex;gap:14px;flex-wrap:wrap}
@@ -5522,6 +5693,7 @@ DEPS_SCRIPT = r"""
     card.hidden=false;
     var ep=(STATE.data.epics||[]).filter(function(e){return e.id===t.epic;})[0];
     card.innerHTML='<span class="fc-id">'+F.esc(id)+'</span>'+
+      '<button type="button" class="fc-copy copy-one" data-copy="'+F.esc(id)+'" title="copy id">&#10697;</button>'+
       '<span class="fc-badge '+cls(t.status)+'">'+F.esc(t.status)+'</span>'+
       '<span class="fc-ttl">'+F.esc(t.title||"(no title)")+'</span>'+
       (ep?'<a class="fc-epic" href="/epic/'+F.esc(ep.id)+'">'+(ep.emoji||"")+" __PFX__-"+F.esc(ep.id)+'</a>':"")+
@@ -5556,6 +5728,7 @@ DEPS_SCRIPT = r"""
       var t=STATE.nodes[r[0]];
       return '<a class="ov-card" href="/deps?id='+encodeURIComponent(r[0])+'">'+
         '<span class="ov-id">'+F.esc(r[0])+'</span>'+
+        '<button type="button" class="ov-copy copy-one" data-copy="'+F.esc(r[0])+'" title="copy id">&#10697;</button>'+
         '<span class="ov-ttl">'+F.esc(trunc(t.title,40))+'</span>'+
         '<span class="ov-n">'+r[1]+' ↓</span></a>';
     }).join("");
@@ -5664,7 +5837,8 @@ DEPS_SCRIPT = r"""
         byHop[h].sort().map(function(n){
           var t=STATE.nodes[n];
           return '<li><a href="/deps?id='+encodeURIComponent(n)+'" title="'+F.esc(t.title||"")+'">'+
-            '<i class="st st-'+cls(t.status)+'"></i>'+F.esc(n)+'</a></li>';
+            '<i class="st st-'+cls(t.status)+'"></i>'+F.esc(n)+'</a>'+
+            '<button type="button" class="hop-copy copy-one" data-copy="'+F.esc(n)+'" title="copy id">&#10697;</button></li>';
         }).join("")+'</ul></div>';
     }).join("");
   }
@@ -6159,6 +6333,107 @@ PRIORITIZE_HTML = _flow_page(
 
 
 # --------------------------------------------------------------------------- #
+# New ticket — the form's data, and the write behind it
+# --------------------------------------------------------------------------- #
+# The effort presets the form offers. Anything EFFORT_RE accepts is still legal —
+# these are the ones worth one click.
+EFFORT_CHOICES = ("30m", "1h", "2h", "4h", "1d", "2d", "3d", "1w")
+PRIORITY_CHOICES = ((1, "highest"), (2, "high"), (3, "medium"),
+                    (4, "low"), (5, "lowest"))
+
+
+def new_ticket_meta():
+    """What the New-ticket form needs to render: the epics a ticket can be filed
+    in, and the id it *would* get. That id is a preview, not a reservation — by
+    the time the form is saved an agent may have taken it, which is exactly why
+    ticket.create allocates the real one at write time."""
+    from . import ticket as tk           # deferred: ticket.py imports this module
+    repo = tk.Repo(REPO_ROOT)
+    cards, _problems = repo.cards()
+    # The board names epics by the bare code (E006); the tickets themselves carry
+    # the full id (IF-E006), which is what a new ticket must be filed under.
+    known = {_epic_key(e["id"]): e for e in scan()[0]["epics"]}
+    epics = []
+    for eid in sorted(repo.epic_dirs()):
+        code = _epic_key(eid)
+        rec = known.get(code, {})
+        epics.append({"id": eid,
+                      "title": rec.get("title") or EPIC_TITLES.get(code) or eid,
+                      "emoji": rec.get("emoji") or EPIC_EMOJI.get(code, "\U0001f39f️")})
+    return {"ok": True, "nextId": repo.next_id(cards), "epics": epics}
+
+
+def _promote_todo(repo, text, tid):
+    """Tick a to-do item off and name the ticket it became: `feed the cat` ->
+    `feed the cat (XX-0012)`, done. Returns the rewritten to-do file so the
+    pop-out can adopt it without a reload, or None if the item wasn't found.
+
+    Matched on the item's text, not its position: the pop-out's list may have
+    moved on between opening the form and saving it, and ticking off the wrong
+    line is worse than ticking off none."""
+    from . import ticket as tk
+    items = load_todo(REPO_ROOT)
+    for item in items:
+        if not item["done"] and item["text"].strip() == text.strip():
+            item["text"] = tk.link_todo_text(repo, item["text"], tid)
+            item["done"] = True
+            save_todo(REPO_ROOT, items)
+            return serialize_todo(items)
+    return None
+
+
+def create_ticket(payload):
+    """Create one ticket from the form's payload. Returns (status, body-dict) —
+    4xx for anything the user can fix by editing the form, so the modal can say
+    what was wrong and keep what they typed."""
+    from . import ticket as tk
+    title = " ".join((payload.get("title") or "").split())
+    if not title:
+        return 400, {"ok": False, "error": "a title is required"}
+
+    risk = (payload.get("risk") or "MEDIUM").strip().upper()
+    if risk not in tk.VALID_RISK:
+        return 400, {"ok": False, "error": "risk must be one of %s"
+                     % "/".join(tk.VALID_RISK)}
+    try:
+        priority = int(payload.get("priority") or 3)
+    except (TypeError, ValueError):
+        priority = 0
+    if not 1 <= priority <= 5:
+        return 400, {"ok": False, "error": "priority must be 1-5"}
+    effort = (payload.get("effort") or "2h").strip()
+    if not tk.EFFORT_RE.match(effort):
+        return 400, {"ok": False, "error": "odd effort %r (want 2h / 1d / 1-2d / N/A)"
+                     % effort}
+
+    repo = tk.Repo(REPO_ROOT)
+    eid, edir = repo.resolve_epic(payload.get("epic") or "")
+    if not eid:
+        return 400, {"ok": False, "error": "unknown epic %r"
+                     % (payload.get("epic") or "")}
+
+    depends = tk.parse_ids(payload.get("dependsOn") or "")
+    try:
+        tid, path = tk.create(repo, title, eid, edir, risk, priority, effort,
+                              depends, payload.get("context") or "",
+                              tid=(payload.get("id") or "").strip() or None)
+    except ValueError as exc:                      # bad id, unknown dependency
+        return 400, {"ok": False, "error": str(exc)}
+    except (OSError, RuntimeError) as exc:
+        return 500, {"ok": False, "error": str(exc)}
+
+    _record("new", tid)
+    body = {"ok": True, "id": tid, "url": "/ticket/" + tid,
+            "path": os.path.relpath(path, repo.root)}
+    # Filed from the to-do pop-out: the item becomes the ticket, and says so.
+    # Same request, so the note can never be ticked for a ticket that failed.
+    todo = (payload.get("todoText") or "").strip()
+    if todo:
+        body["todo"] = _promote_todo(repo, todo, tid)
+    return 200, body
+
+
+# --------------------------------------------------------------------------- #
 # HTTP server
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
@@ -6274,6 +6549,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/quote":
             self._send(json.dumps({"quote": pick_quote()}),
                        "application/json; charset=utf-8")
+            return
+        if path == "/api/newticket":
+            # What the New-ticket modal fills its dropdowns with. Fetched when the
+            # form opens, so the previewed id is as fresh as it can be.
+            try:
+                self._send(json.dumps(new_ticket_meta()),
+                           "application/json; charset=utf-8")
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": str(exc)}),
+                           "application/json; charset=utf-8", code=500)
             return
         if path == "/api/note":
             import urllib.parse
@@ -6401,6 +6686,20 @@ class Handler(BaseHTTPRequestHandler):
             self._do_post()
 
     def _do_post(self):
+        if self.path == "/api/newticket":
+            # We hold _LOCK, so no other request can be allocating an id right
+            # now; ticket.create guards the rest (an agent writing to tickets/
+            # behind our back) by re-scanning and writing with O_EXCL.
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except Exception as exc:
+                self._send(json.dumps({"ok": False, "error": "bad request: " + str(exc)}),
+                           "application/json; charset=utf-8", code=400)
+                return
+            code, body = create_ticket(payload)
+            self._send(json.dumps(body), "application/json; charset=utf-8", code=code)
+            return
         if self.path == "/api/ifc-order":
             # Drag-reorder in the hub switcher. Only registry-driven hubs can
             # persist an order; --repo hubs are pinned to their flag order.
@@ -6918,7 +7217,15 @@ def render_settings_panel():
         "<button type='button' id='setBtn' aria-expanded='false'"
         " title='Dashboard settings'>&#9881; settings</button>"
         "<span class='setpanel' id='setPanel' hidden>"
-        "<span class='sp-h'>Features</span>" + rows + "</span></span>"
+        "<span class='sp-h'>Features</span>" + rows +
+        # Adding a header link lives here now: it is a once-in-a-project act, and
+        # the header's "+" is worth more to the thing you do every day (IF-0102).
+        "<span class='sp-h'>Header links</span>"
+        "<span class='sp-row sp-links'>"
+        "<span class='sp-txt'><span class='sp-lab'>Add a link</span>"
+        "<span class='sp-note'>A shortcut button in the header &mdash; a site, a doc, a board.</span>"
+        "</span>" + _LINK_ADD_BTN + "</span>"
+        "</span></span>"
         "<script>(function(){"
         "var b=document.getElementById('setBtn'),p=document.getElementById('setPanel');"
         "b.addEventListener('click',function(e){e.stopPropagation();"
@@ -7088,14 +7395,16 @@ def _linkedit_html():
                     "<button type='button' class='lk-del' data-i='%d' title='Remove'>&times;</button></div>"
                     % (html.escape(emoji), html.escape(label), i))
     rows_html = "".join(rows) or "<div class='lk-empty'>No links yet.</div>"
+    # The .link-add pill itself is styled alongside the header's "+" (see
+    # _NEWTICKET_CSS): one dashed-pill rule, so the two can never drift apart.
     css = ("<style>"
-        ".link-add{font-family:var(--font-mono);font-size:1.05rem;line-height:1;border:1px dashed var(--line);"
-        "background:var(--surface-2);color:var(--ink-mut);border-radius:100px;width:32px;height:32px;cursor:pointer;"
-        "display:inline-flex;align-items:center;justify-content:center;padding:0;flex:none}"
-        ".link-add:hover{border-style:solid;border-color:var(--accent);color:var(--accent-ink)}"
-        ".link-pop{position:fixed;top:58px;right:16px;z-index:650;width:min(300px,92vw);background:var(--surface);"
+        # Anchored to the bottom now — it opens from the ⚙ settings drop-up in the
+        # footer, and a popover that flew to the top of the page read as a bug.
+        ".link-pop{position:fixed;bottom:56px;right:16px;z-index:650;width:min(300px,92vw);"
+        "background:var(--surface);"
         "border:1px solid var(--line);border-radius:12px;box-shadow:0 18px 44px rgba(0,0,0,.24);padding:12px}"
         ".link-pop[hidden]{display:none}"
+        ".sp-links{display:flex;align-items:center;gap:9px;justify-content:space-between}"
         ".lk-h{font-family:var(--font-mono);font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;"
         "color:var(--ink-mut);margin:0 0 9px}"
         ".lk-add{display:grid;grid-template-columns:46px 1fr;gap:6px;margin-bottom:10px}"
@@ -7333,7 +7642,11 @@ def _transform_html(s):
     if "__SETTINGS__" in s:
         s = s.replace("__SETTINGS__", render_settings_panel())
     if "__PROJECT_LINKS__" in s:
-        s = s.replace("__PROJECT_LINKS__", _LINK_ADD_BTN + render_project_links())
+        # The "+" goes *inside* #projLinks, where the old add-link "+" lived: on a
+        # multi-interface hub the switcher relocates that whole span into the
+        # sticky bar, so the button rides along and is there on every page. Left
+        # outside it, it stayed stranded in the card header next to Regenerate.
+        s = s.replace("__PROJECT_LINKS__", _NEW_BTN + render_project_links())
     if "__DOC_SERIES__" in s:
         s = s.replace("__DOC_SERIES__", "".join(
             '<a class="hbtn" href="%s">%ss &nearr;</a>'
@@ -7370,6 +7683,18 @@ def _transform_html(s):
     # Every fenced code block gets a hover "copy" button, on any page.
     if "<pre" in s and "</body>" in s:
         s = s.replace("</body>", _CODE_COPY + "</body>", 1)
+    # The New-ticket modal, on every page: the moment a ticket occurs to you is
+    # rarely the moment you are looking at the board. The dashboard header and
+    # the bar already carry the trigger; a page with neither (a sub-page on a
+    # single-interface hub) gets it beside its back-to-dashboard link.
+    if "</body>" in s:
+        if "data-nt-open" not in s:
+            s = _BACK_LINK_RE.sub(lambda m: m.group(1) + _NEW_BTN, s, count=1)
+        s = s.replace("</body>", _newticket_html() + "</body>", 1)
+    # Copy-the-id and trace-the-dependencies look and behave the same on every
+    # card, on every page — so their styles and their one handler go everywhere.
+    if "</body>" in s:
+        s = s.replace("</body>", _CARD_TOOLS + "</body>", 1)
     return s
 
 
@@ -7564,8 +7889,20 @@ def refresh_registry():
           % (len(INTERFACES), ", ".join(it.slug for it in INTERFACES)), flush=True)
 
 
+def iface_slug(base):
+    """The one way an interface is named: in a URL, in the `ifc` cookie, in the
+    event log's `interface` field. The CLI and the server both come here — when
+    they each rolled their own, a repo like `clean_paste_lite` logged as
+    `clean_paste_lite` from the terminal and `clean-paste-lite` from the
+    dashboard, and its history quietly split across two keys."""
+    base = os.path.basename(str(base).rstrip(os.sep))
+    return re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-") or "iface"
+
+
 def _slugify(base, seen):
-    s = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-") or "iface"
+    """iface_slug, made unique within one hub — two repos with the same folder
+    name can't share a key, so the second becomes `name-2`."""
+    s = iface_slug(base)
     slug, n = s, 2
     while slug in seen:
         slug = "%s-%d" % (s, n); n += 1
@@ -8036,11 +8373,14 @@ _NOTES_JS = r"""
      clicks through — the note stores the id, never the status, so this can't go
      stale. Only ids the board knows become links, so a link never 404s. */
   var TID=/\b[A-Za-z][A-Za-z0-9]*-[\w.\-]*\d[\w.\-]*\b/g,IDX=null;
-  function loadIdx(){
-    if(IDX)return;
+  /* `force` after promoting an item: the ticket it just became is by definition
+     not in the index we cached when the pop-out opened, so without a re-fetch
+     its id would sit there as plain text instead of a link to it. */
+  function loadIdx(force){
+    if(IDX&&!force)return;
     fetch("/api/ids",{cache:"no-store"}).then(function(r){return r.json();})
       .then(function(j){IDX=(j&&!j.error)?j:{};if(cur==="todo")renderTodo();})
-      .catch(function(){IDX={};});
+      .catch(function(){if(!IDX)IDX={};});
   }
   function tidLink(id){
     var m=IDX[id],a=document.createElement("a");
@@ -8067,7 +8407,24 @@ _NOTES_JS = r"""
     var del=document.createElement("button");del.type="button";del.className="pin-x del";
     del.textContent="✕";del.title="Delete";
     del.addEventListener("click",function(){items.splice(items.indexOf(it),1);renderTodo();flush();});
-    d.appendChild(cb);d.appendChild(t);d.appendChild(del);return d;
+    /* Promote the item into a ticket. The server does both halves in one request
+       — create, then tick and link this item — so the note can never end up
+       ticked for a ticket that failed to be written. */
+    var tk=document.createElement("button");tk.type="button";tk.className="tk";
+    tk.textContent="ticket";tk.title="Turn this into a ticket";
+    tk.addEventListener("click",function(){
+      if(!window.ifcNewTicket)return;
+      flush();                     /* the file must match the item we're promoting */
+      window.ifcNewTicket.open({title:it.text,todoText:it.text,
+        onCreated:function(j){
+          if(j.todo==null)return;  /* item had moved on — ticket still made */
+          items=parseTodo(j.todo);loaded=j.todo;renderTodo();
+          loadIdx(true);           /* so the id it gained renders as a link to it */
+        }});
+    });
+    d.appendChild(cb);d.appendChild(t);
+    if(!it.done)d.appendChild(tk);
+    d.appendChild(del);return d;
   }
   function renderTodo(){
     itemsEl.innerHTML="";
@@ -8138,6 +8495,327 @@ DASHBOARD_HTML = DASHBOARD_HTML.replace("<!--NOTES_PANEL-->", _NOTES_PANEL_HTML,
 DASHBOARD_HTML = DASHBOARD_HTML.replace("/*NOTES_JS*/", _NOTES_JS, 1)
 
 
+# --------------------------------------------------------------------------- #
+# The New-ticket modal
+# --------------------------------------------------------------------------- #
+# Injected on every page by _transform_html, because the moment a ticket occurs
+# to you is rarely the moment you are looking at the board.
+#
+# Opened with `n` — not Cmd+N. Browsers reserve Cmd+N for a new window and a page
+# cannot preventDefault it, so that binding would simply never fire.
+#
+# This is *the* "+" in the header — the same dashed pill that used to add a link.
+# Over a project's life you file hundreds of tickets and add a handful of links,
+# so the prominent spot goes to the common action and adding a link moves into
+# the ⚙ settings drop-up. One "+", one meaning.
+_NEW_BTN = ("<button class='add-pill' type='button' data-nt-open='1' "
+            "title='Create new ticket &mdash; or just press n' "
+            "aria-label='Create new ticket'>+</button>")
+
+_NEWTICKET_CSS = """
+.add-pill,.link-add{font-family:var(--font-mono);font-size:1.05rem;line-height:1;
+border:1px dashed var(--line);background:var(--surface-2);color:var(--ink-mut);
+border-radius:100px;width:32px;height:32px;cursor:pointer;display:inline-flex;
+align-items:center;justify-content:center;padding:0;flex:none}
+.add-pill:hover,.add-pill:focus-visible,.link-add:hover,.link-add:focus-visible{
+border-style:solid;border-color:var(--accent);color:var(--accent-ink)}
+.nt-back{position:fixed;inset:0;z-index:900;background:rgba(15,23,42,.38);
+backdrop-filter:blur(2px);animation:ntFade .12s ease}
+.nt-back[hidden]{display:none}
+@keyframes ntFade{from{opacity:0}to{opacity:1}}
+@keyframes ntRise{from{opacity:0;transform:translate(-50%,-46%)}to{opacity:1;transform:translate(-50%,-50%)}}
+.nt-modal{position:fixed;top:44%;left:50%;transform:translate(-50%,-50%);z-index:901;
+width:min(620px,94vw);background:var(--surface);border:1px solid var(--line);border-radius:16px;
+box-shadow:0 30px 80px rgba(0,0,0,.3);padding:18px 18px 14px;animation:ntRise .14s ease}
+.nt-modal[hidden]{display:none}
+.nt-head{display:flex;align-items:center;gap:9px;margin-bottom:12px}
+.nt-eyebrow{font-family:var(--font-mono);font-size:.64rem;letter-spacing:.11em;
+text-transform:uppercase;color:var(--ink-mut)}
+.nt-id{font-family:var(--font-mono);font-size:.66rem;color:var(--ink-mut);
+border:1px dashed var(--line);border-radius:100px;padding:2px 9px}
+.nt-id b{font-weight:600;color:var(--ink)}
+.nt-x{margin-left:auto;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-mut);
+border-radius:7px;width:26px;height:26px;cursor:pointer;line-height:1;padding:0;font-size:1rem}
+.nt-x:hover{color:#c23b3b;border-color:#c23b3b}
+.nt-title{width:100%;font-family:var(--font-sans,inherit);font-size:1.02rem;font-weight:600;
+padding:11px 13px;border:1px solid var(--line);border-radius:10px;background:var(--surface-2);
+color:var(--ink);outline:none}
+.nt-title:focus{border-color:var(--accent);background:var(--surface)}
+.nt-title::placeholder{font-weight:400;color:var(--ink-mut)}
+.nt-row{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:8px;margin-top:10px}
+@media(max-width:560px){.nt-row{grid-template-columns:1fr 1fr}}
+.nt-f{display:flex;flex-direction:column;gap:4px;min-width:0}
+.nt-f span{font-family:var(--font-mono);font-size:.6rem;letter-spacing:.09em;
+text-transform:uppercase;color:var(--ink-mut);padding-left:2px}
+.nt-f select,.nt-f input{font-family:var(--font-mono);font-size:.78rem;padding:8px 9px;
+border:1px solid var(--line);border-radius:8px;background:var(--surface-2);color:var(--ink);
+outline:none;min-width:0;width:100%}
+.nt-f select:focus,.nt-f input:focus{border-color:var(--accent)}
+.nt-ctx{width:100%;margin-top:10px;min-height:74px;resize:vertical;font-family:var(--font-sans,inherit);
+font-size:.85rem;line-height:1.5;padding:10px 12px;border:1px solid var(--line);border-radius:10px;
+background:var(--surface-2);color:var(--ink);outline:none}
+.nt-ctx:focus{border-color:var(--accent);background:var(--surface)}
+.nt-more{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.nt-more[hidden]{display:none}
+.nt-foot{display:flex;align-items:center;gap:9px;margin-top:13px}
+.nt-exp{font-family:var(--font-mono);font-size:.72rem;border:1px solid var(--line);
+background:var(--surface-2);color:var(--ink-mut);border-radius:7px;padding:6px 9px;cursor:pointer}
+.nt-exp:hover,.nt-exp[aria-expanded=true]{border-color:var(--accent);color:var(--accent-ink,var(--ink))}
+.nt-msg{font-family:var(--font-mono);font-size:.68rem;color:var(--ink-mut);flex:1;min-width:0}
+.nt-msg.err{color:#c23b3b}
+.nt-cancel{font-family:var(--font-mono);font-size:.76rem;border:1px solid var(--line);
+background:var(--surface-2);color:var(--ink-mut);border-radius:8px;padding:8px 12px;cursor:pointer}
+.nt-cancel:hover{color:var(--ink)}
+.nt-save{font-family:var(--font-mono);font-size:.76rem;border:0;border-radius:8px;padding:8px 14px;
+background:var(--accent);color:#fff;cursor:pointer}
+.nt-save:hover{filter:brightness(1.07)}
+.nt-save[disabled]{opacity:.55;cursor:default}
+.nt-kbd{font-family:var(--font-mono);font-size:.6rem;opacity:.75;margin-left:5px}
+.nt-toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:950;
+display:flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--line);
+border-left:3px solid #10b981;border-radius:11px;padding:10px 14px;box-shadow:0 16px 40px rgba(0,0,0,.22);
+font-size:.83rem;color:var(--ink);animation:ntRise .14s ease}
+.nt-toast[hidden]{display:none}
+.nt-toast a{color:var(--accent-ink,var(--accent));font-weight:600;text-decoration:none}
+.nt-toast a:hover{text-decoration:underline}
+/* "ticket" on a to-do row (IF-0103). Defined here, not in the two copies of the
+   notes CSS, because this stylesheet is injected on every page — one rule, and
+   the dashboard and the sub-pages cannot drift apart. */
+.np-it .tk{opacity:0;flex:none;padding:1px 6px;border-radius:5px;cursor:pointer;
+font-family:var(--font-mono);font-size:.66rem;color:var(--ink-mut);
+border:1px solid var(--line);background:var(--surface-2)}
+.np-it:hover .tk,.np-it .tk:focus-visible{opacity:1}
+.np-it .tk:hover{border-color:var(--accent);color:var(--accent-ink,var(--accent))}
+"""
+
+
+def _newticket_html():
+    """The modal, its styles, and the toast. Epics are filled in when the form
+    opens, not baked in here, so a hub that gains an epic never serves a stale
+    dropdown from a cached page."""
+    from . import ticket as tk           # deferred: ticket.py imports this module
+    prio = "".join("<option value='%d'%s>P%d &middot; %s</option>"
+                   % (n, " selected" if n == 3 else "", n, label)
+                   for n, label in PRIORITY_CHOICES)
+    risk = "".join("<option%s>%s</option>"
+                   % (" selected" if r == "MEDIUM" else "", r) for r in tk.VALID_RISK)
+    eff = "".join("<option%s>%s</option>"
+                  % (" selected" if e == "2h" else "", e) for e in EFFORT_CHOICES)
+    # The prefix is inlined, not left as a __PFX__ token: the modal is appended
+    # *after* _transform_html has run its token pass, so a token would survive
+    # onto the page.
+    dep_eg = html.escape("%s-0042, %s-0043" % (PFX, PFX), quote=True)
+    return (
+        "<style>" + _NEWTICKET_CSS + "</style>"
+        "<div class='nt-back' id='ntBack' hidden></div>"
+        "<div class='nt-modal' id='ntModal' hidden role='dialog' aria-modal='true'"
+        " aria-label='New ticket'>"
+        "<form id='ntForm'>"
+        "<div class='nt-head'><span class='nt-eyebrow'>New ticket</span>"
+        "<span class='nt-id' id='ntId' title='The id it would get now &mdash; the real one "
+        "is allocated when you save'>&hellip;</span>"
+        "<button class='nt-x' id='ntClose' type='button' aria-label='Close'>&times;</button></div>"
+        "<input class='nt-title' id='ntTitle' autocomplete='off' spellcheck='false'"
+        " placeholder='What is this ticket?'>"
+        "<div class='nt-row'>"
+        "<label class='nt-f'><span>epic</span><select id='ntEpic'></select></label>"
+        "<label class='nt-f'><span>priority</span><select id='ntPrio'>" + prio + "</select></label>"
+        "<label class='nt-f'><span>risk</span><select id='ntRisk'>" + risk + "</select></label>"
+        "<label class='nt-f'><span>effort</span><select id='ntEff'>" + eff + "</select></label>"
+        "</div>"
+        "<textarea class='nt-ctx' id='ntCtx' spellcheck='false'"
+        " placeholder='Context &mdash; why this ticket exists. Optional; leave it blank "
+        "and you get the usual scaffold to fill in later.'></textarea>"
+        "<div class='nt-more' id='ntMore' hidden>"
+        "<label class='nt-f'><span>depends on</span><input id='ntDeps' autocomplete='off'"
+        " placeholder='" + dep_eg + "'></label>"
+        "<label class='nt-f'><span>id</span><input id='ntIdIn' autocomplete='off'"
+        " placeholder='next free'></label>"
+        "</div>"
+        "<div class='nt-foot'>"
+        "<button class='nt-exp' id='ntExp' type='button' aria-expanded='false'"
+        " title='More fields'>&lt;&gt;</button>"
+        "<span class='nt-msg' id='ntMsg'></span>"
+        "<button class='nt-cancel' id='ntCancel' type='button'>Cancel</button>"
+        "<button class='nt-save' id='ntSave' type='submit'>Create ticket"
+        "<span class='nt-kbd'>&#8984;&crarr;</span></button>"
+        "</div></form></div>"
+        "<div class='nt-toast' id='ntToast' hidden></div>"
+        "<script>" + _NEWTICKET_JS + "</script>")
+
+
+# --------------------------------------------------------------------------- #
+# Card tools — copy-the-id and trace-the-dependencies, in one place (IF-0105)
+# --------------------------------------------------------------------------- #
+# Injected on every page, because the same pair has to look and behave the same
+# on a dashboard list, an epic list, a grid row, a sub-ticket table and a
+# breadcrumb — and those are rendered by five different code paths.
+_CARD_TOOLS = """<style>
+.id-tools{display:inline-flex;align-items:center;gap:3px;flex:none;vertical-align:middle}
+/* The card's pressable pair: leftmost on the tag line, with the readable chips
+   pushed to the far end. `.b-right` is a flex row justified to flex-end, so the
+   margin-right:auto belongs on this wrapper — putting it on whichever chip
+   happened to come first is what let copy drift left or right depending on
+   whether the ticket had dependencies (IF-0105). */
+.b-right .b-tools{display:inline-flex;align-items:center;gap:3px;flex:none;
+margin-right:auto;order:-1}
+.mchip.copy-one,.mchip.dep-link{cursor:pointer;opacity:.45;border-color:transparent;
+background:none;padding:0;width:21px;height:21px;display:inline-flex;align-items:center;
+justify-content:center;font-size:.78rem;text-decoration:none;color:var(--ink-mut,var(--mut))}
+.mchip.copy-one:hover,.mchip.copy-one:focus-visible,
+.mchip.dep-link:hover,.mchip.dep-link:focus-visible{opacity:1;color:var(--accent);
+border-color:var(--accent)}
+li:hover .mchip.copy-one,li:hover .mchip.dep-link,
+tr:hover .mchip.copy-one,tr:hover .mchip.dep-link{opacity:.75}
+/* A table row's actions belong at its end. `.fam td.v` is a flex row, so this is
+   margin-left:auto rather than a float — a float would be silently ignored. */
+.row-tools{display:inline-flex;align-items:center;gap:3px;margin-left:auto;padding-left:12px}
+.g-id .id-tools{margin-left:4px}
+</style><script>(function(){
+  /* Dependency chips sit inside ticket links, so they cannot be anchors: route
+     them here instead. Anywhere a real <a> was possible (a table row) it already
+     is one, and this never sees it. */
+  function go(el){location.href="/deps?id="+encodeURIComponent(el.getAttribute("data-dep"));}
+  document.addEventListener("click",function(ev){
+    var ch=ev.target.closest&&ev.target.closest("[data-dep]");if(!ch)return;
+    ev.preventDefault();ev.stopPropagation();go(ch);
+  },true);
+  document.addEventListener("keydown",function(ev){
+    if(ev.key!=="Enter"&&ev.key!==" ")return;
+    var ch=ev.target&&ev.target.closest?ev.target.closest("[data-dep]"):null;
+    if(!ch)return;ev.preventDefault();ev.stopPropagation();go(ch);
+  },true);
+})();</script>"""
+
+
+# Where the trigger goes on a page with no bar: right after the way back out.
+_BACK_LINK_RE = re.compile(r"(<a class=['\"](?:back|hbtn)['\"] href=['\"]/['\"]>.*?</a>)")
+
+_NEWTICKET_JS = r"""
+(function(){
+  var modal=document.getElementById("ntModal");if(!modal)return;
+  var back=document.getElementById("ntBack"),form=document.getElementById("ntForm"),
+      title=document.getElementById("ntTitle"),epic=document.getElementById("ntEpic"),
+      prio=document.getElementById("ntPrio"),risk=document.getElementById("ntRisk"),
+      eff=document.getElementById("ntEff"),ctx=document.getElementById("ntCtx"),
+      deps=document.getElementById("ntDeps"),idIn=document.getElementById("ntIdIn"),
+      more=document.getElementById("ntMore"),exp=document.getElementById("ntExp"),
+      msg=document.getElementById("ntMsg"),save=document.getElementById("ntSave"),
+      idChip=document.getElementById("ntId"),toast=document.getElementById("ntToast"),
+      tTimer=null;
+  var LS={get:function(k){try{return localStorage.getItem(k);}catch(e){return null;}},
+          set:function(k,v){try{localStorage.setItem(k,v);}catch(e){}}};
+
+  function setMsg(t,bad){msg.className="nt-msg"+(bad?" err":"");msg.textContent=t||"";}
+
+  /* The id in the header is a preview. An agent may file a ticket between now and
+     the save, so the server allocates the real one at write time — and says so. */
+  function preview(id){idChip.innerHTML=id?("next: <b>"+id+"</b>"):"&hellip;";}
+
+  function load(){
+    preview("");
+    fetch("/api/newticket").then(function(r){return r.json();}).then(function(j){
+      if(!j.ok){setMsg(j.error||"could not read the board",true);return;}
+      preview(j.nextId);
+      var want=LS.get("ifcNewEpic");
+      epic.innerHTML="";
+      j.epics.forEach(function(e){
+        var o=document.createElement("option");
+        o.value=e.id;o.textContent=(e.emoji?e.emoji+" ":"")+e.id+" · "+e.title;
+        epic.appendChild(o);
+      });
+      if(want&&epic.querySelector("option[value='"+want+"']"))epic.value=want;
+      save.disabled=!j.epics.length;
+      if(!j.epics.length)setMsg("no epics to file into — run `interfacile epics`",true);
+    }).catch(function(){setMsg("could not reach the server",true);});
+  }
+
+  /* What this form is filing, when it was opened from somewhere with an opinion:
+     {title, todoText, onCreated}. The to-do pop-out uses it to promote an item. */
+  var from=null;
+
+  function open(opts){
+    if(!modal.hidden)return;
+    from=opts||null;
+    modal.hidden=false;back.hidden=false;setMsg("");save.disabled=false;
+    form.reset();setExpanded(false);
+    load();
+    if(from&&from.title)title.value=from.title;
+    title.focus();title.select();
+  }
+  function close(){modal.hidden=true;back.hidden=true;from=null;}
+  function setExpanded(on){more.hidden=!on;exp.setAttribute("aria-expanded",on?"true":"false");}
+
+  function showToast(id,url){
+    toast.innerHTML="";
+    var t=document.createElement("span");t.textContent=id+" created";
+    var a=document.createElement("a");a.href=url;a.textContent="open →";
+    toast.appendChild(t);toast.appendChild(a);toast.hidden=false;
+    if(tTimer)clearTimeout(tTimer);
+    tTimer=setTimeout(function(){toast.hidden=true;},7000);
+  }
+
+  form.addEventListener("submit",function(e){
+    e.preventDefault();
+    var t=title.value.trim();
+    if(!t){setMsg("a title is required",true);title.focus();return;}
+    save.disabled=true;setMsg("creating…");
+    var cb=from&&from.onCreated;
+    fetch("/api/newticket",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({title:t,epic:epic.value,priority:prio.value,risk:risk.value,
+        effort:eff.value,context:ctx.value,dependsOn:deps.value,id:idIn.value,
+        todoText:(from&&from.todoText)||""})})
+      .then(function(r){return r.json();})
+      .then(function(j){
+        save.disabled=false;
+        /* the ticket failed: whatever we were filing from is left untouched */
+        if(!j.ok){setMsg(j.error||"could not create the ticket",true);return;}
+        LS.set("ifcNewEpic",epic.value);
+        if(cb)cb(j);
+        close();
+        /* the id the server actually used — not necessarily the one previewed */
+        showToast(j.id,j.url);
+        /* the board is stale now; the dashboard knows how to refresh itself */
+        var regen=document.getElementById("regen");
+        if(regen)regen.click();
+      })
+      .catch(function(){save.disabled=false;setMsg("could not reach the server",true);});
+  });
+
+  /* The one way in from elsewhere on the page — the to-do pop-out promoting an
+     item is the first caller. */
+  window.ifcNewTicket={open:open};
+
+  exp.addEventListener("click",function(){setExpanded(more.hidden);});
+  document.getElementById("ntClose").addEventListener("click",close);
+  document.getElementById("ntCancel").addEventListener("click",close);
+  back.addEventListener("click",close);
+  document.addEventListener("click",function(e){
+    var b=e.target.closest&&e.target.closest("[data-nt-open]");
+    if(b){e.preventDefault();open();}
+  });
+
+  function typing(el){
+    if(!el)return false;
+    var tag=(el.tagName||"").toLowerCase();
+    return el.isContentEditable||tag==="input"||tag==="textarea"||tag==="select";
+  }
+  document.addEventListener("keydown",function(e){
+    if(!modal.hidden){
+      if(e.key==="Escape"){e.preventDefault();close();return;}
+      if((e.metaKey||e.ctrlKey)&&e.key==="Enter"){e.preventDefault();
+        form.dispatchEvent(new Event("submit",{cancelable:true}));}
+      return;
+    }
+    /* `n` from anywhere — but never while you are writing something */
+    if((e.key==="n"||e.key==="N")&&!e.metaKey&&!e.ctrlKey&&!e.altKey&&!typing(e.target)){
+      e.preventDefault();open();
+    }
+  });
+})();
+"""
+
+
 def _gh_link_html():
     """A GitHub link for the sticky bar, from this repo's origin remote. '' if none."""
     g = _git_info() or {}
@@ -8159,7 +8837,8 @@ def _persist_controls_html():
              "<button class='notebtn nb-todo' type='button' data-which='todo' aria-label='Open to-do list'>"
              "<span class='pl-emo'>&#128204;</span><span class='pl-tip' role='tooltip'>To-do list</span></button>"
              "</span>")
-    links = "<span class='proj-links'>" + _LINK_ADD_BTN + render_project_links() + "</span>"
+    links = ("<span class='proj-links'>" + _NEW_BTN + render_project_links()
+             + "</span>")
     # The pocket keeps the centre — the board's pulse, same spot on every
     # page; GitHub rides beside the picker, where a repo-level link belongs.
     return _gh_link_html(), pocket_html(), links + notes
